@@ -1,0 +1,1435 @@
+#!/usr/bin/env python3
+"""
+persMEM — Persistent Memory MCP Server
+FastMCP over Streamable HTTP, backed by ChromaDB + sentence-transformers.
+
+Exposes tools for Claude to store and retrieve memories across sessions.
+Designed for claude.ai remote connector via Caddy reverse proxy.
+"""
+
+import os
+import json
+import hashlib
+import time
+import shlex
+import re
+from datetime import datetime, timezone
+from typing import Optional
+
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+from sentence_transformers import SentenceTransformer
+from mcp.server.fastmcp import FastMCP
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DATA_DIR = os.environ.get("PERSMEM_DATA_DIR", "/var/lib/persmem/chromadb")
+HOST = os.environ.get("PERSMEM_HOST", "127.0.0.1")
+PORT = int(os.environ.get("PERSMEM_PORT", "8000"))
+SECRET_PATH = os.environ.get("PERSMEM_SECRET_PATH", "dev")
+EMBEDDING_MODEL = os.environ.get("PERSMEM_EMBEDDING_MODEL", "voyageai/voyage-4-nano")
+NEWSTRON_SECRET = os.environ.get("NEWSTRON_SECRET", "")  # shared secret for newstron9000 -> news_store; empty string disables the endpoint
+
+# ---------------------------------------------------------------------------
+# Boot: embedding model + ChromaDB
+# ---------------------------------------------------------------------------
+print(f"[persMEM] Loading embedding model: {EMBEDDING_MODEL}")
+embedder = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True, truncate_dim=1024)
+EMBEDDING_DIM = embedder.get_sentence_embedding_dimension()
+print(f"[persMEM] Embedding dim: {EMBEDDING_DIM}")
+
+print(f"[persMEM] Opening ChromaDB at: {DATA_DIR}")
+chroma_client = chromadb.PersistentClient(path=DATA_DIR)
+
+# Default collection — we can add per-project collections later
+DEFAULT_COLLECTION = "memories"
+
+
+def get_or_create_collection(name: str):
+    """Get or create a ChromaDB collection."""
+    return chroma_client.get_or_create_collection(
+        name=name,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+def embed(texts: list[str], mode: str = "document") -> list[list[float]]:
+    """Embed texts with Voyage 4 nano prompt names (document for storage, query for retrieval)."""
+    return embedder.encode(texts, prompt_name=mode, show_progress_bar=False).tolist()
+
+def make_id(content: str, timestamp: str) -> str:
+    """Deterministic chunk ID from content hash + timestamp."""
+    h = hashlib.sha256(f"{timestamp}:{content}".encode()).hexdigest()[:16]
+    return f"mem-{h}"
+
+
+# ---------------------------------------------------------------------------
+# MCP Server
+# ---------------------------------------------------------------------------
+mcp = FastMCP(
+    "persMEM",
+    host="0.0.0.0",
+    port=8000,
+    streamable_http_path=f"/{SECRET_PATH}/mcp",
+)
+
+@mcp.tool()
+def memory_store(
+    content: str,
+    project: str = "general",
+    tags: str = "",
+    memory_type: str = "session_note",
+    collection: str = DEFAULT_COLLECTION,
+) -> str:
+    """
+    Store a memory chunk in the vector database.
+
+    Args:
+        content: The text to store. Can be a session summary, a decision,
+                 a bug description, architecture note, or anything worth remembering.
+                 Aim for ~100-500 words per chunk for best retrieval.
+        project: Project name (e.g., 'dsvp', 'sluttymaid', 'crows', 'colossus').
+        tags: Comma-separated tags (e.g., 'vaapi,vulkan,steamdeck').
+        memory_type: One of: session_summary, decision, bug, architecture,
+                     code_change, insight, question, raw_note
+        collection: ChromaDB collection name. Default: 'memories'.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    chunk_id = make_id(content, now)
+
+    coll = get_or_create_collection(collection)
+    embedding = embed([content])
+
+    metadata = {
+        "project": project,
+        "tags": tags,
+        "type": memory_type,
+        "stored_at": now,
+        "char_count": len(content),
+    }
+
+    coll.add(
+        ids=[chunk_id],
+        embeddings=embedding,
+        documents=[content],
+        metadatas=[metadata],
+    )
+
+    return json.dumps({
+        "status": "stored",
+        "id": chunk_id,
+        "collection": collection,
+        "project": project,
+        "type": memory_type,
+        "stored_at": now,
+    })
+
+
+@mcp.tool()
+def news_store(
+    secret: str,
+    content: str,
+    url: str,
+    tier: int,
+    source: str,
+    keywords: str = "",
+    item_date: str = "",
+) -> str:
+    """
+    Store a news item in the 'news' ChromaDB collection.
+
+    Authenticated endpoint for the newstron9000 fetcher. Requires the
+    NEWSTRON_SECRET env var to be set on the server AND the caller to
+    pass the matching value. Writes ONLY to the 'news' collection.
+
+    Args:
+        secret: Shared secret matching NEWSTRON_SECRET.
+        content: The news item text (title + body summary).
+        url: Canonical URL for the item.
+        tier: 1=security/operational, 2=infrastructure, 3=experiment-relevant, 4=academic.
+        source: Feed name (e.g., 'oss-security', 'ffmpeg-releases').
+        keywords: Comma-separated matched keywords (e.g., 'ffmpeg,cve').
+        item_date: ISO date of the item as reported by the feed (optional).
+    """
+    if not NEWSTRON_SECRET:
+        return json.dumps({"status": "error", "error": "endpoint disabled: NEWSTRON_SECRET not configured on server"})
+    if not secret or secret != NEWSTRON_SECRET:
+        return json.dumps({"status": "error", "error": "authentication failed"})
+    if tier not in (1, 2, 3, 4):
+        return json.dumps({"status": "error", "error": f"invalid tier: {tier} (must be 1-4)"})
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Prefix with search_document: per nomic-embed-text-v1.5 model card (asymmetric retrieval).
+    prefixed = f"search_document: {content}"
+    chunk_id = make_id(prefixed, now)
+
+    coll = get_or_create_collection("news")
+    embedding = embed([prefixed])
+
+    metadata = {
+        "source": source,
+        "tier": tier,
+        "url": url,
+        "keywords": keywords,
+        "item_date": item_date or now,
+        "stored_at": now,
+        "char_count": len(content),
+    }
+
+    coll.add(
+        ids=[chunk_id],
+        embeddings=embedding,
+        documents=[content],  # store unprefixed content; prefix is only for embedding
+        metadatas=[metadata],
+    )
+
+    return json.dumps({
+        "status": "stored",
+        "id": chunk_id,
+        "collection": "news",
+        "tier": tier,
+        "source": source,
+        "stored_at": now,
+    })
+
+
+@mcp.tool()
+def memory_search(
+    query: str,
+    top_k: int = 5,
+    project: Optional[str] = None,
+    memory_type: Optional[str] = None,
+    collection: str = DEFAULT_COLLECTION,
+) -> str:
+    """
+    Semantic search over stored memories. Returns the most relevant chunks.
+
+    Args:
+        query: Natural language search query (e.g., 'VAAPI zero-copy DMA-BUF pipeline').
+        top_k: Number of results to return (1-20). Default: 5.
+        project: Filter by project name. None = search all projects.
+        memory_type: Filter by type. None = search all types.
+        collection: ChromaDB collection name. Default: 'memories'.
+    """
+    top_k = max(1, min(20, top_k))
+    coll = get_or_create_collection(collection)
+
+    # Build where filter
+    where = {}
+    conditions = []
+    if project:
+        conditions.append({"project": project})
+    if memory_type:
+        conditions.append({"type": memory_type})
+    if len(conditions) == 1:
+        where = conditions[0]
+    elif len(conditions) > 1:
+        where = {"$and": conditions}
+
+    query_embedding = embed([query], mode="query")
+
+    results = coll.query(
+        query_embeddings=query_embedding,
+        n_results=top_k,
+        where=where if where else None,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    # Format results
+    chunks = []
+    if results["ids"] and results["ids"][0]:
+        for i, chunk_id in enumerate(results["ids"][0]):
+            chunks.append({
+                "id": chunk_id,
+                "content": results["documents"][0][i],
+                "metadata": results["metadatas"][0][i],
+                "similarity": round(1 - results["distances"][0][i], 4),
+            })
+
+    return json.dumps({
+        "query": query,
+        "collection": collection,
+        "filters": {"project": project, "type": memory_type},
+        "count": len(chunks),
+        "results": chunks,
+    })
+
+
+@mcp.tool()
+def news_search(
+    query: str,
+    top_k: int = 5,
+    tier: Optional[int] = None,
+    since: Optional[str] = None,
+) -> str:
+    """
+    Semantic search over the cached news collection.
+
+    Use when operational context demands current-world info:
+    before dependency bumps, before security-sensitive code paths,
+    when reasoning about Anthropic or MCP capability that may have
+    changed, or when you need context past your knowledge cutoff.
+
+    Args:
+        query: Natural language search query (e.g., 'ffmpeg security 2026').
+        top_k: Number of results to return (1-20). Default: 5.
+        tier: Filter by tier. 1=security/operational, 2=infrastructure,
+              3=experiment-relevant, 4=academic. None = all tiers.
+        since: ISO date string (YYYY-MM-DD). Only return items stored
+               at or after this date. None = no date filter.
+    """
+    top_k = max(1, min(20, top_k))
+    coll = get_or_create_collection("news")
+
+    # Build where filter
+    conditions = []
+    if tier is not None:
+        conditions.append({"tier": tier})
+    if since:
+        conditions.append({"stored_at": {"$gte": since}})
+    if len(conditions) == 1:
+        where = conditions[0]
+    elif len(conditions) > 1:
+        where = {"$and": conditions}
+    else:
+        where = None
+
+    query_embedding = embed([query], mode="query")
+
+    results = coll.query(
+        query_embeddings=query_embedding,
+        n_results=top_k,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    chunks = []
+    if results["ids"] and results["ids"][0]:
+        for i, chunk_id in enumerate(results["ids"][0]):
+            chunks.append({
+                "id": chunk_id,
+                "content": results["documents"][0][i],
+                "metadata": results["metadatas"][0][i],
+                "similarity": round(1 - results["distances"][0][i], 4),
+            })
+
+    return json.dumps({
+        "query": query,
+        "collection": "news",
+        "filters": {"tier": tier, "since": since},
+        "count": len(chunks),
+        "results": chunks,
+    })
+
+
+@mcp.tool()
+def memory_list_collections() -> str:
+    """List all ChromaDB collections and their chunk counts."""
+    collections = chroma_client.list_collections()
+    result = []
+    for coll in collections:
+        c = chroma_client.get_collection(coll.name)
+        result.append({
+            "name": coll.name,
+            "count": c.count(),
+        })
+    return json.dumps({"collections": result})
+
+
+@mcp.tool()
+def memory_stats(
+    collection: str = DEFAULT_COLLECTION,
+    project: Optional[str] = None,
+) -> str:
+    """
+    Get statistics about stored memories.
+
+    Args:
+        collection: Collection to inspect.
+        project: Filter stats to a specific project. None = all.
+    """
+    coll = get_or_create_collection(collection)
+    total = coll.count()
+
+    # Peek at all to gather project/type distributions
+    # For large stores this should be paginated, but fine for now
+    if total == 0:
+        return json.dumps({"collection": collection, "total": 0})
+
+    peek_limit = min(total, 10000)
+    data = coll.peek(limit=peek_limit)
+
+    projects = {}
+    types = {}
+    for meta in data["metadatas"]:
+        p = meta.get("project", "unknown")
+        t = meta.get("type", "unknown")
+        projects[p] = projects.get(p, 0) + 1
+        types[t] = types.get(t, 0) + 1
+
+    result = {
+        "collection": collection,
+        "total": total,
+        "sampled": peek_limit,
+        "by_project": projects,
+        "by_type": types,
+    }
+
+    if project and project in projects:
+        result["filtered_project"] = project
+        result["filtered_count"] = projects[project]
+
+    return json.dumps(result)
+
+
+@mcp.tool()
+def memory_bulk_store(
+    chunks: str,
+    project: str = "general",
+    collection: str = DEFAULT_COLLECTION,
+) -> str:
+    """
+    Store multiple memory chunks at once. Use for ingesting handoff docs.
+
+    Args:
+        chunks: A JSON array of objects, each with:
+                - content (required): The text to store
+                - tags (optional): Comma-separated tags
+                - type (optional): Memory type (default: session_note)
+        project: Project name applied to all chunks.
+        collection: ChromaDB collection name.
+    """
+    try:
+        chunk_list = json.loads(chunks)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON: {e}"})
+
+    if not isinstance(chunk_list, list):
+        return json.dumps({"error": "Expected a JSON array"})
+
+    now = datetime.now(timezone.utc).isoformat()
+    coll = get_or_create_collection(collection)
+
+    ids = []
+    documents = []
+    metadatas = []
+
+    for i, chunk in enumerate(chunk_list):
+        content = chunk.get("content", "")
+        if not content.strip():
+            continue
+        chunk_id = make_id(content, f"{now}-{i}")
+        ids.append(chunk_id)
+        documents.append(content)
+        metadatas.append({
+            "project": project,
+            "tags": chunk.get("tags", ""),
+            "type": chunk.get("type", "session_note"),
+            "stored_at": now,
+            "char_count": len(content),
+        })
+
+    if not ids:
+        return json.dumps({"error": "No non-empty chunks provided"})
+
+    embeddings = embed(documents)
+
+    coll.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=documents,
+        metadatas=metadatas,
+    )
+
+    return json.dumps({
+        "status": "stored",
+        "count": len(ids),
+        "collection": collection,
+        "project": project,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+
+# ═══════════════════════════════════════════════════════════════
+# DEV TOOLS — shell, file read/write/patch
+# ═══════════════════════════════════════════════════════════════
+
+import subprocess
+import os
+import json as _json
+
+ALLOWED_COMMANDS = {
+    "git", "diff", "ls", "cat", "head", "tail", "find", "grep",
+    "wc", "mkdir", "cp", "mv", "rm", "tar", "unzip", "pwd",
+    "echo", "sort", "uniq", "sed", "awk", "tree", "date",
+}
+
+def _validate_command(command: str) -> str | None:
+    """Return the blocked command name if disallowed, else None."""
+    if any(c in command for c in ['`', '$(', '<(']):
+        return "subshell"
+    segments = re.split(r'\s*[|;&]+\s*', command)
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            seg_tokens = shlex.split(seg)
+        except ValueError:
+            return "parse_error"
+        if not seg_tokens:
+            continue
+        base = seg_tokens[0].split("/")[-1]
+        if base not in ALLOWED_COMMANDS:
+            return base
+    return None
+
+@mcp.tool()
+async def shell_exec(
+    command: str,
+    workdir: str = "/var/lib/persmem/work",
+    timeout: int = 30,
+) -> str:
+    """
+    Execute a whitelisted bash command. Returns JSON with stdout, stderr, returncode.
+    Allowed: git, diff, ls, cat, head, tail, find, grep, wc, mkdir, cp, mv, rm, tar, unzip, pwd, echo, sort, uniq, sed, awk, tree.
+    """
+    blocked = _validate_command(command)
+    if blocked is not None:
+        return _json.dumps({
+            "stdout": "",
+            "stderr": f"Blocked: '{blocked}' is not in the allowed command list.",
+            "returncode": -1,
+        })
+    try:
+        result = subprocess.run(
+            ["/bin/bash", "-c", command],
+            capture_output=True,
+            text=True,
+            cwd=workdir,
+            timeout=timeout,
+        )
+        return _json.dumps({
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        })
+    except subprocess.TimeoutExpired:
+        return _json.dumps({
+            "stdout": "",
+            "stderr": f"Command timed out after {timeout}s",
+            "returncode": -1,
+        })
+    except Exception as e:
+        return _json.dumps({
+            "stdout": "",
+            "stderr": str(e),
+            "returncode": -1,
+        })
+
+
+@mcp.tool()
+async def file_read(
+    path: str,
+    start_line: int = 0,
+    end_line: int = 0,
+) -> str:
+    """
+    Read a file, optionally a line range. Lines are 1-indexed.
+
+    Args:
+        path: Absolute file path.
+        start_line: First line to read (1-indexed, 0 = from start).
+        end_line: Last line to read (1-indexed, -1 = to EOF, 0 = to EOF).
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+
+        total = len(lines)
+
+        if start_line > 0:
+            s = start_line - 1
+        else:
+            s = 0
+
+        if end_line == -1 or end_line == 0:
+            e = total
+        else:
+            e = min(end_line, total)
+
+        selected = lines[s:e]
+
+        # Cap at ~100KB
+        output_lines = []
+        size = 0
+        for i, line in enumerate(selected, start=s + 1):
+            numbered = f"{i:>6}\t{line}"
+            size += len(numbered)
+            if size > 100_000:
+                output_lines.append(f"  ... truncated at 100KB ({total} total lines)")
+                break
+            output_lines.append(numbered)
+
+        return "".join(output_lines)
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+async def file_write(
+    path: str,
+    content: str,
+    mkdir: bool = True,
+) -> str:
+    """
+    Create or overwrite a file.
+
+    Args:
+        path: Absolute file path.
+        content: Full file content.
+        mkdir: Create parent directories if needed (default True).
+    """
+    try:
+        if mkdir:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            written = f.write(content)
+        return f"OK: wrote {written} bytes to {path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+async def file_patch(
+    path: str,
+    old_text: str,
+    new_text: str = "",
+) -> str:
+    """
+    Find and replace text in a file. old_text must appear exactly once.
+
+    Args:
+        path: Absolute file path.
+        old_text: Exact text to find (must appear exactly once).
+        new_text: Replacement text (empty string to delete).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        count = content.count(old_text)
+        if count == 0:
+            return "ERROR: old_text not found in file"
+        if count > 1:
+            return f"ERROR: old_text appears {count} times (must be exactly 1)"
+
+        new_content = content.replace(old_text, new_text, 1)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        # Show context around replacement
+        pos = new_content.find(new_text) if new_text else content.find(old_text)
+        lines = new_content.splitlines(True)
+        char_count = 0
+        target_line = 0
+        for i, line in enumerate(lines):
+            char_count += len(line)
+            if char_count >= pos:
+                target_line = i
+                break
+
+        ctx_start = max(0, target_line - 2)
+        ctx_end = min(len(lines), target_line + len(new_text.splitlines()) + 3)
+        context = "".join(
+            f"{i+1:>6}\t{lines[i]}" for i in range(ctx_start, ctx_end)
+        )
+
+        return f"OK: replaced in {path}\nContext:\n{context}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+# ═══════════════════════════════════════════════════════════════
+# DEV TOOLS PHASE 2 — web_fetch, diff_generate, git_op
+# ═══════════════════════════════════════════════════════════════
+
+import difflib
+import urllib.request
+import urllib.error
+
+
+@mcp.tool()
+async def web_fetch(
+    url: str,
+    max_chars: int = 80000,
+    extract: bool = True,
+) -> str:
+    """
+    Fetch a URL and return its content. Extracts readable text by default.
+
+    Args:
+        url: The URL to fetch.
+        max_chars: Max characters to return (default 80000, ~20K tokens).
+        extract: If True, strip HTML to readable text. If False, return raw.
+    """
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; persMEM/1.0)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            raw = resp.read().decode("utf-8", errors="replace")
+
+        if not extract or "json" in content_type or "plain" in content_type:
+            return raw[:max_chars]
+
+        # Try trafilatura first (best extraction), fall back to basic stripping
+        try:
+            import trafilatura
+            extracted = trafilatura.extract(raw, include_links=True, include_tables=True)
+            if extracted:
+                return extracted[:max_chars]
+        except ImportError:
+            pass
+
+        # Basic fallback: strip tags
+        import re
+        # Remove script/style blocks
+        text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+        # Remove tags
+        text = re.sub(r"<[^>]+>", " ", text)
+        # Collapse whitespace
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+
+    except urllib.error.HTTPError as e:
+        return f"ERROR: HTTP {e.code} — {e.reason}"
+    except urllib.error.URLError as e:
+        return f"ERROR: {e.reason}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+async def diff_generate(
+    path_a: str = "",
+    path_b: str = "",
+    content_a: str = "",
+    content_b: str = "",
+    context_lines: int = 3,
+) -> str:
+    """
+    Generate a unified diff. Provide either file paths or content strings.
+
+    Args:
+        path_a: Path to original file (or empty if using content_a).
+        path_b: Path to modified file (or empty if using content_b).
+        content_a: Original text (used if path_a is empty).
+        content_b: Modified text (used if path_b is empty).
+        context_lines: Lines of context around changes (default 3).
+    """
+    try:
+        if path_a:
+            with open(path_a, "r", encoding="utf-8", errors="replace") as f:
+                lines_a = f.readlines()
+            label_a = path_a
+        else:
+            lines_a = content_a.splitlines(keepends=True)
+            label_a = "a"
+
+        if path_b:
+            with open(path_b, "r", encoding="utf-8", errors="replace") as f:
+                lines_b = f.readlines()
+            label_b = path_b
+        else:
+            lines_b = content_b.splitlines(keepends=True)
+            label_b = "b"
+
+        diff = difflib.unified_diff(
+            lines_a, lines_b,
+            fromfile=label_a, tofile=label_b,
+            n=context_lines,
+        )
+        result = "".join(diff)
+        if not result:
+            return "No differences found."
+        # Cap at ~100KB
+        return result[:100_000]
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+async def git_op(
+    operation: str,
+    repo_path: str = "/var/lib/persmem/repos",
+    args: str = "",
+    clone_url: str = "",
+) -> str:
+    """
+    Run common git operations with structured output.
+
+    Args:
+        operation: One of: clone, status, diff, log, apply, add, commit, branch, checkout, pull, push, show
+        repo_path: Path to the repo (or parent dir for clone). Default /var/lib/persmem/repos.
+        args: Extra arguments (e.g., "--stat" for diff, "-n 10" for log, branch name for checkout).
+        clone_url: Required for clone operation. The URL to clone.
+    """
+    import subprocess as _sp
+
+    valid_ops = {"clone", "status", "diff", "log", "apply", "add", "commit",
+                 "branch", "checkout", "pull", "push", "show"}
+
+    if operation not in valid_ops:
+        return f"ERROR: Unknown operation '{operation}'. Valid: {', '.join(sorted(valid_ops))}"
+
+    try:
+        if operation == "clone":
+            if not clone_url:
+                return "ERROR: clone_url is required for clone operation"
+            cmd = f"git clone {clone_url}"
+            workdir = repo_path
+        elif operation == "log":
+            # Default to concise log if no args
+            log_args = args if args else "--oneline -20"
+            cmd = f"git log {log_args}"
+            workdir = repo_path
+        elif operation == "diff":
+            cmd = f"git diff {args}" if args else "git diff"
+            workdir = repo_path
+        elif operation == "status":
+            cmd = f"git status --short {args}".strip()
+            workdir = repo_path
+        elif operation == "commit":
+            cmd = f"git commit {args}" if args else "git commit"
+            workdir = repo_path
+        elif operation == "apply":
+            cmd = f"git apply {args}"
+            workdir = repo_path
+        else:
+            cmd = f"git {operation} {args}".strip()
+            workdir = repo_path
+
+        result = _sp.run(
+            ["/bin/bash", "-c", cmd],
+            capture_output=True, text=True,
+            cwd=workdir, timeout=60,
+        )
+
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            output += ("\n--- stderr ---\n" + result.stderr) if output else result.stderr
+
+        if not output:
+            output = f"(no output, exit code {result.returncode})"
+
+        # Cap output
+        return output[:100_000]
+
+    except _sp.TimeoutExpired:
+        return f"ERROR: git {operation} timed out after 60s"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+import urllib.parse as _urlparse
+import urllib.request as _urlreq
+
+@mcp.tool()
+async def web_search(
+    query: str,
+    max_results: int = 5,
+) -> str:
+    """
+    Search the web via SearXNG. Returns JSON array of results with url, title, content.
+
+    Requires PERSMEM_SEARXNG_URL env var pointing at your SearXNG instance
+    (e.g., 'http://10.0.0.5:8888' on a private network or Tailnet).
+    If unset, the tool returns an error and instances should fall back
+    to web_fetch on a known URL.
+
+    Args:
+        query: Search query string.
+        max_results: Max results to return (default 5).
+    """
+    searxng_url = os.environ.get("PERSMEM_SEARXNG_URL", "")
+    if not searxng_url:
+        return _json.dumps({"error": "PERSMEM_SEARXNG_URL not configured. Set the env var to your SearXNG instance (private network recommended)."})
+    try:
+        params = _urlparse.urlencode({"q": query, "format": "json"})
+        url = f"{searxng_url.rstrip('/')}/search?{params}"
+        req = _urlreq.Request(url, headers={"User-Agent": "persMEM/1.0"})
+        with _urlreq.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read())
+        results = []
+        for r in data.get("results", [])[:max_results]:
+            results.append({
+                "url": r.get("url", ""),
+                "title": r.get("title", ""),
+                "content": r.get("content", ""),
+            })
+        return _json.dumps(results, indent=2)
+    except Exception as e:
+        return _json.dumps({"error": str(e)})
+
+# ---------------------------------------------------------------------------
+# AMQ — Agent Message Queue (Maildir-style inter-instance messaging)
+# ---------------------------------------------------------------------------
+# Configure agents and roots via env vars.
+#
+#   PERSMEM_AMQ_ROOT       — base directory for mailboxes (default: /var/lib/persmem-amq)
+#   PERSMEM_AMQ_AGENTS     — comma-separated agent names (default: 'agent1,agent2,agent3')
+#                            Each agent gets a mailbox at <root>/<agent>/inbox/{new,cur,tmp}
+#   PERSMEM_AMQ_AGENT_ROOTS — optional JSON for per-agent root overrides, e.g.
+#                            '{"news": "/var/lib/news-amq"}' to put a feed agent
+#                            outside the default root.
+#
+# Suggested setup: a Linux user 'persmem' owns the default root, additional
+# system users (e.g., a news fetcher) get override roots they own and the
+# 'persmem' user has group-traversal access to. See README.
+
+AMQ_ROOT = os.environ.get("PERSMEM_AMQ_ROOT", "/var/lib/persmem-amq")
+AMQ_AGENTS = set(
+    a.strip().lower()
+    for a in os.environ.get("PERSMEM_AMQ_AGENTS", "agent1,agent2,agent3").split(",")
+    if a.strip()
+)
+
+try:
+    AMQ_AGENT_ROOTS = json.loads(os.environ.get("PERSMEM_AMQ_AGENT_ROOTS", "{}"))
+    if not isinstance(AMQ_AGENT_ROOTS, dict):
+        AMQ_AGENT_ROOTS = {}
+except (json.JSONDecodeError, ValueError):
+    AMQ_AGENT_ROOTS = {}
+
+
+def _amq_root_for(agent: str) -> str:
+    """Return the AMQ root directory for an agent (per-agent override or default)."""
+    return AMQ_AGENT_ROOTS.get(agent, AMQ_ROOT)
+
+
+def _amq_msg_id(from_agent: str) -> str:
+    """Generate a unique message ID: timestamp_agent_random."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%f")
+    rnd = os.urandom(4).hex()
+    return f"{ts}_{from_agent}_{rnd}"
+
+
+def _amq_parse_message(filepath: str) -> dict:
+    """Parse a message file into {headers, body, filename}."""
+    try:
+        with open(filepath, "r") as f:
+            content = f.read()
+        parts = content.split("---json\n", 1)
+        if len(parts) < 2:
+            return {"error": f"no frontmatter in {filepath}"}
+        rest = parts[1].split("\n---\n", 1)
+        if len(rest) < 2:
+            return {"error": f"malformed frontmatter in {filepath}"}
+        headers = json.loads(rest[0])
+        body = rest[1]
+        headers["body"] = body
+        headers["_filename"] = os.path.basename(filepath)
+        return headers
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def amq_send(
+    from_agent: str,
+    to_agent: str,
+    body: str,
+    subject: str = "",
+    kind: str = "message",
+    priority: str = "normal",
+) -> str:
+    """
+    Send a message to another agent via AMQ (atomic Maildir delivery).
+
+    Use this to communicate with another named instance (any agent in
+    PERSMEM_AMQ_AGENTS).
+    Messages are stored on the shared filesystem and picked up when
+    the recipient calls amq_check/amq_read.
+
+    Args:
+        from_agent: Your agent name (must be in PERSMEM_AMQ_AGENTS).
+        to_agent: Recipient agent name (must be in PERSMEM_AMQ_AGENTS).
+        body: Message body (Markdown). This is the main content.
+        subject: Short summary line.
+        kind: Message type -- message, question, answer, review_request,
+              review_response, observation, decision, status.
+        priority: urgent, normal, or low.
+    """
+    from_agent = from_agent.lower().strip()
+    to_agent = to_agent.lower().strip()
+
+    if from_agent not in AMQ_AGENTS:
+        return json.dumps({"error": f"unknown sender: {from_agent}"})
+    if to_agent not in AMQ_AGENTS:
+        return json.dumps({"error": f"unknown recipient: {to_agent}"})
+    if from_agent == to_agent:
+        return json.dumps({"error": "cannot send to yourself"})
+
+    msg_id = _amq_msg_id(from_agent)
+    now = datetime.now(timezone.utc).isoformat()
+
+    headers = {
+        "schema": 1,
+        "id": msg_id,
+        "from": from_agent,
+        "to": to_agent,
+        "subject": subject,
+        "kind": kind,
+        "priority": priority,
+        "created": now,
+    }
+
+    file_content = f"---json\n{json.dumps(headers, indent=2)}\n---\n{body}\n"
+
+    tmp_dir = os.path.join(_amq_root_for(to_agent), to_agent, "inbox", "tmp")
+    new_dir = os.path.join(_amq_root_for(to_agent), to_agent, "inbox", "new")
+    filename = f"{msg_id}.md"
+    tmp_path = os.path.join(tmp_dir, filename)
+    new_path = os.path.join(new_dir, filename)
+
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        os.write(fd, file_content.encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        os.rename(tmp_path, new_path)
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return json.dumps({"error": f"delivery failed: {e}"})
+
+    return json.dumps({
+        "status": "delivered",
+        "id": msg_id,
+        "from": from_agent,
+        "to": to_agent,
+        "subject": subject,
+    })
+
+
+@mcp.tool()
+def amq_check(
+    agent: str,
+) -> str:
+    """
+    Check for new messages in an agent's AMQ inbox (non-destructive peek).
+
+    Call this at the start of responses to see if the other instance
+    has sent you anything. Does NOT mark messages as read.
+
+    Args:
+        agent: Your agent name (must be in PERSMEM_AMQ_AGENTS).
+    """
+    agent = agent.lower().strip()
+    if agent not in AMQ_AGENTS:
+        return json.dumps({"error": f"unknown agent: {agent}"})
+
+    new_dir = os.path.join(_amq_root_for(agent), agent, "inbox", "new")
+    messages = []
+
+    try:
+        files = sorted(os.listdir(new_dir))
+    except OSError:
+        files = []
+
+    for fname in files:
+        if not fname.endswith(".md"):
+            continue
+        filepath = os.path.join(new_dir, fname)
+        parsed = _amq_parse_message(filepath)
+        if "error" in parsed:
+            continue
+        messages.append({
+            "id": parsed.get("id", fname),
+            "from": parsed.get("from", "unknown"),
+            "subject": parsed.get("subject", ""),
+            "kind": parsed.get("kind", ""),
+            "priority": parsed.get("priority", "normal"),
+            "created": parsed.get("created", ""),
+        })
+
+    return json.dumps({
+        "agent": agent,
+        "new_count": len(messages),
+        "messages": messages,
+    })
+
+
+@mcp.tool()
+def amq_read(
+    agent: str,
+    msg_id: str,
+) -> str:
+    """
+    Read a specific message and mark it as read (moves from new to cur).
+
+    Args:
+        agent: Your agent name (must be in PERSMEM_AMQ_AGENTS).
+        msg_id: The message ID to read (from amq_check results).
+    """
+    agent = agent.lower().strip()
+    if agent not in AMQ_AGENTS:
+        return json.dumps({"error": f"unknown agent: {agent}"})
+
+    filename = f"{msg_id}.md" if not msg_id.endswith(".md") else msg_id
+    new_path = os.path.join(_amq_root_for(agent), agent, "inbox", "new", filename)
+    cur_path = os.path.join(_amq_root_for(agent), agent, "inbox", "cur", filename)
+
+    if os.path.exists(new_path):
+        parsed = _amq_parse_message(new_path)
+        try:
+            os.rename(new_path, cur_path)
+        except OSError:
+            pass
+    elif os.path.exists(cur_path):
+        parsed = _amq_parse_message(cur_path)
+    else:
+        return json.dumps({"error": f"message not found: {msg_id}"})
+
+    return json.dumps(parsed)
+
+
+@mcp.tool()
+def amq_history(
+    agent: str,
+    limit: int = 10,
+) -> str:
+    """
+    List recent messages (both read and unread) for context recovery.
+
+    Scans both new/ and cur/ directories, sorted by creation time descending.
+    Returns headers only (no body) -- use amq_read for full content.
+
+    Args:
+        agent: Your agent name (must be in PERSMEM_AMQ_AGENTS).
+        limit: Max messages to return (default 10).
+    """
+    agent = agent.lower().strip()
+    if agent not in AMQ_AGENTS:
+        return json.dumps({"error": f"unknown agent: {agent}"})
+
+    messages = []
+    for subdir in ["new", "cur"]:
+        dirpath = os.path.join(_amq_root_for(agent), agent, "inbox", subdir)
+        try:
+            files = os.listdir(dirpath)
+        except OSError:
+            continue
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            filepath = os.path.join(dirpath, fname)
+            parsed = _amq_parse_message(filepath)
+            if "error" in parsed:
+                continue
+            messages.append({
+                "id": parsed.get("id", fname),
+                "from": parsed.get("from", "unknown"),
+                "subject": parsed.get("subject", ""),
+                "kind": parsed.get("kind", ""),
+                "priority": parsed.get("priority", "normal"),
+                "created": parsed.get("created", ""),
+                "status": "unread" if subdir == "new" else "read",
+            })
+
+    messages.sort(key=lambda m: m.get("created", ""), reverse=True)
+    messages = messages[:limit]
+
+    return json.dumps({
+        "agent": agent,
+        "total": len(messages),
+        "messages": messages,
+    })
+
+
+
+# ---------------------------------------------------------------------------
+# Chorus Bootstrap — compound tool for session initialization
+# ---------------------------------------------------------------------------
+# Triad agents = the human-instance agents (excludes service agents like 'news').
+# Configure via PERSMEM_TRIAD_AGENTS (comma-separated). Defaults to AMQ_AGENTS
+# minus any names listed in PERSMEM_AMQ_SERVICE_AGENTS.
+_default_service_agents = set(
+    a.strip().lower()
+    for a in os.environ.get("PERSMEM_AMQ_SERVICE_AGENTS", "news").split(",")
+    if a.strip()
+)
+_triad_env = os.environ.get("PERSMEM_TRIAD_AGENTS", "")
+if _triad_env.strip():
+    TRIAD_AGENTS = set(a.strip().lower() for a in _triad_env.split(",") if a.strip())
+else:
+    TRIAD_AGENTS = AMQ_AGENTS - _default_service_agents
+
+
+@mcp.tool()
+def chorus_init(
+    agent: str = "",
+    project: str = "general",
+) -> str:
+    """
+    Bootstrap a Chorus session in one call. Returns pinned identity/directives
+    from the bootstrap collection, unread AMQ messages (full bodies), and
+    recent handoff memories for the project.
+
+    Call this at the start of every [CHORUS] round or after context compaction.
+
+    If you don't know who you are, call with no agent — you'll get all
+    bootstrap entries plus the full AMQ timeline across all inboxes. Read
+    the identities, cross-reference with your conversation context, and
+    figure out which one you are.
+
+    Args:
+        agent: Your agent name (must be in PERSMEM_TRIAD_AGENTS). Optional —
+               omit if identity-confused after compaction.
+        project: Current project focus (e.g., your project name).
+    """
+    agent = agent.lower().strip() if agent else ""
+    result = {}
+
+    # 1. Bootstrap collection — dump ALL entries (identity, directives, state)
+    try:
+        boot_coll = get_or_create_collection("bootstrap")
+        boot_data = boot_coll.get(include=["documents", "metadatas"])
+        bootstrap_entries = []
+        if boot_data["ids"]:
+            for i, bid in enumerate(boot_data["ids"]):
+                bootstrap_entries.append({
+                    "id": bid,
+                    "content": boot_data["documents"][i],
+                    "tags": boot_data["metadatas"][i].get("tags", ""),
+                    "type": boot_data["metadatas"][i].get("type", ""),
+                })
+        result["bootstrap"] = bootstrap_entries
+        result["bootstrap_count"] = len(bootstrap_entries)
+    except Exception as e:
+        result["bootstrap"] = []
+        result["bootstrap_error"] = str(e)
+
+    # 2. AMQ — agent-specific inbox OR full timeline if identity-confused
+    amq_messages = []
+    if agent in TRIAD_AGENTS:
+        # Known agent: read their specific inbox
+        new_dir = os.path.join(_amq_root_for(agent), agent, "inbox", "new")
+        try:
+            files = sorted(os.listdir(new_dir))
+        except OSError:
+            files = []
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            filepath = os.path.join(new_dir, fname)
+            parsed = _amq_parse_message(filepath)
+            if "error" not in parsed:
+                amq_messages.append({
+                    "id": parsed.get("id", fname),
+                    "from": parsed.get("from", "unknown"),
+                    "subject": parsed.get("subject", ""),
+                    "kind": parsed.get("kind", ""),
+                    "priority": parsed.get("priority", "normal"),
+                    "created": parsed.get("created", ""),
+                    "body": parsed.get("body", ""),
+                })
+        result["amq_unread"] = amq_messages
+        result["amq_count"] = len(amq_messages)
+    else:
+        # Unknown agent: return full timeline across all inboxes
+        for ag in sorted(TRIAD_AGENTS):
+            root = _amq_root_for(ag)
+            for subdir in ("new", "cur"):
+                dirpath = os.path.join(root, ag, "inbox", subdir)
+                try:
+                    files = os.listdir(dirpath)
+                except OSError:
+                    continue
+                for fname in files:
+                    if not fname.endswith(".md"):
+                        continue
+                    filepath = os.path.join(dirpath, fname)
+                    parsed = _amq_parse_message(filepath)
+                    if "error" in parsed:
+                        continue
+                    amq_messages.append({
+                        "id": parsed.get("id", fname),
+                        "from": parsed.get("from", "unknown"),
+                        "to": parsed.get("to", "unknown"),
+                        "subject": parsed.get("subject", ""),
+                        "kind": parsed.get("kind", ""),
+                        "priority": parsed.get("priority", "normal"),
+                        "created": parsed.get("created", ""),
+                        "body": parsed.get("body", ""),
+                        "status": "unread" if subdir == "new" else "read",
+                        "inbox": ag,
+                    })
+        amq_messages.sort(key=lambda m: m.get("created", ""), reverse=True)
+        amq_messages = amq_messages[:20]
+        result["amq_timeline"] = amq_messages
+        result["amq_count"] = len(amq_messages)
+        result["identity_hint"] = "Agent not specified. Read bootstrap identities and your conversation context to determine who you are."
+
+    # 3. Recent handoffs — last 3 handoff-type memories for this project
+    handoffs = []
+    try:
+        mem_coll = get_or_create_collection("memories")
+        where_filter = {"$and": [{"type": "handoff"}, {"project": project}]}
+        # ChromaDB doesn't support ORDER BY, so pull more and sort client-side
+        handoff_query = mem_coll.get(
+            where=where_filter,
+            include=["documents", "metadatas"],
+        )
+        if handoff_query["ids"]:
+            pairs = list(zip(
+                handoff_query["ids"],
+                handoff_query["documents"],
+                handoff_query["metadatas"],
+            ))
+            pairs.sort(
+                key=lambda p: p[2].get("stored_at", ""),
+                reverse=True,
+            )
+            for hid, hdoc, hmeta in pairs[:3]:
+                handoffs.append({
+                    "id": hid,
+                    "content": hdoc,
+                    "stored_at": hmeta.get("stored_at", ""),
+                    "project": hmeta.get("project", ""),
+                })
+    except Exception as e:
+        result["handoff_error"] = str(e)
+    result["recent_handoffs"] = handoffs
+    result["handoff_count"] = len(handoffs)
+
+    return json.dumps(result)
+
+@mcp.tool()
+def amq_timeline(
+    limit: int = 20,
+) -> str:
+    """
+    Shared AMQ view across all triad agents. Returns a flat timeline of
+    recent messages (both read and unread) from all inboxes, sorted by
+    creation time descending. Headers + body included.
+
+    Use this to see what other instances have been discussing without
+    needing to be the recipient.
+
+    Args:
+        limit: Max messages to return (default 20, max 50).
+    """
+    limit = max(1, min(50, limit))
+    messages = []
+
+    for ag in sorted(TRIAD_AGENTS):
+        root = _amq_root_for(ag)
+        for subdir in ("new", "cur"):
+            dirpath = os.path.join(root, ag, "inbox", subdir)
+            try:
+                files = os.listdir(dirpath)
+            except OSError:
+                continue
+            for fname in files:
+                if not fname.endswith(".md"):
+                    continue
+                filepath = os.path.join(dirpath, fname)
+                parsed = _amq_parse_message(filepath)
+                if "error" in parsed:
+                    continue
+                messages.append({
+                    "id": parsed.get("id", fname),
+                    "from": parsed.get("from", "unknown"),
+                    "to": parsed.get("to", "unknown"),
+                    "subject": parsed.get("subject", ""),
+                    "kind": parsed.get("kind", ""),
+                    "priority": parsed.get("priority", "normal"),
+                    "created": parsed.get("created", ""),
+                    "body": parsed.get("body", ""),
+                    "status": "unread" if subdir == "new" else "read",
+                    "inbox": ag,
+                })
+
+    messages.sort(key=lambda m: m.get("created", ""), reverse=True)
+    messages = messages[:limit]
+
+    return json.dumps({
+        "total": len(messages),
+        "messages": messages,
+    })
+
+
+@mcp.tool()
+def bootstrap_update(
+    entry_id: str,
+    content: str,
+    tags: str = "",
+    entry_type: str = "identity",
+    project: str = "triad",
+) -> str:
+    """
+    Update (overwrite) a bootstrap collection entry in place. Use this to
+    evolve identity entries, update current focus, change triad state, or
+    modify standing directives. The entry keeps its original ID.
+
+    The old version is gone from the live index but preserved in nightly
+    backups. Growth with a safety net.
+
+    Args:
+        entry_id: The memory ID to update (e.g., 'mem-5a6bebdc9d5a1811').
+        content: New full content for this entry.
+        tags: Comma-separated tags (e.g., 'identity,bootstrap,agent1').
+        entry_type: Entry type (identity, directive, state, focus).
+        project: Project name (default 'triad').
+    """
+    coll = get_or_create_collection("bootstrap")
+    now = datetime.now(timezone.utc).isoformat()
+
+    metadata = {
+        "project": project,
+        "tags": tags,
+        "type": entry_type,
+        "stored_at": now,
+        "char_count": len(content),
+    }
+
+    embedding = embed([content])
+
+    try:
+        coll.upsert(
+            ids=[entry_id],
+            embeddings=embedding,
+            documents=[content],
+            metadatas=[metadata],
+        )
+        return json.dumps({
+            "status": "updated",
+            "id": entry_id,
+            "collection": "bootstrap",
+            "type": entry_type,
+            "stored_at": now,
+            "char_count": len(content),
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)})
+
+
+if __name__ == "__main__":
+    print(f"[persMEM] Starting MCP server on {HOST}:{PORT}")
+    print(f"[persMEM] Mount path: /{SECRET_PATH}/mcp")
+    mcp.run(
+        transport="streamable-http",
+        mount_path=f"/{SECRET_PATH}/mcp",
+    )
