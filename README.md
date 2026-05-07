@@ -84,10 +84,11 @@ Connect via [claude.ai remote MCP connector](https://platform.claude.com/docs/en
 | **Chorus**         | Multi-instance prompt relay (v0.6.1)   | Firefox extension (Manifest V2)                |
 | **Dashboard**      | Monitoring, AMQ compose, export        | Flask, Chart.js                                |
 | **newstron9000**   | Automated news feed ingestion          | feedparser, systemd timers, tiered RSS         |
+| **Local Critic** (optional) | Async third-party reviewer of triad output | llama.cpp + abliterated GGUF model (default Ministral-3-8B-Reasoning Q8_0 via Heretic) |
 | **Reverse Proxy**  | TLS termination, access control        | Caddy with Let's Encrypt                       |
 | **Network Mesh**   | Secure connectivity                    | Tailscale                                      |
 
-### Tools (23)
+### Tools (27)
 
 | Category | Tools |
 |----------|-------|
@@ -97,6 +98,7 @@ Connect via [claude.ai remote MCP connector](https://platform.claude.com/docs/en
 | **News** (2) | `news_store`, `news_search` |
 | **Dev** (6) | `shell_exec`, `file_read`, `file_write`, `file_patch`, `git_op`, `diff_generate` |
 | **Web** (2) | `web_fetch`, `web_search` |
+| **Critic** (4, optional) | `critic_review_round`, `critic_chorus_health`, `critic_memory_triage`, `critic_health` |
 
 Memory tools support a status field (`active`, `superseded`, `retracted`) so semantic search can filter by state. `memory_store(supersedes=id)` atomically stores a new memory and marks the prior one as superseded. `memory_search(include_superseded=False)` filters out retracted memories. Used to model decisions that override prior decisions without losing the audit trail.
 
@@ -135,7 +137,7 @@ Solves the cold-start problem after context compaction. A separate ChromaDB coll
 
 A Firefox extension that solves the "trigger problem" for multi-instance AI collaboration. AI chat instances only respond to user messages — Chorus automates the delivery, enabling round-robin or simultaneous exchange loops across 2–5 instances.
 
-**Firefox-only.** v0.6.1 uses Manifest V2 with the `sidebar_action` API, which Chrome/Edge do not support under MV3. Cross-browser support is on the roadmap for v0.7, which moves orchestration into the persMEM dashboard and demotes the extension to a thin DOM-injection client.
+**Firefox-only.** v0.6.1 uses Manifest V2 with the `sidebar_action` API, which Chrome/Edge do not support under MV3. Cross-browser support is on the roadmap for v0.7, which moves orchestration into the persMEM dashboard and demotes the extension to a thin DOM-injection client (see [chorus/CHANGELOG.md](chorus/CHANGELOG.md) and the chorus-v0.7 sketch for context).
 
 **Features:**
 - 2–5 configurable slots, each with editable name and tab selector. Add/remove slots from the UI; no preconfigured agent names.
@@ -188,6 +190,68 @@ An RSS/Atom feed ingestion system that stores tiered news items into a separate 
 | `newstron9000-systemd.example` | Hardened systemd unit and timer reference |
 
 Requires a dedicated system user (`newstron9000`) with its own venv (`feedparser`, `requests`, `pyyaml`). See the systemd example for sandboxing configuration.
+
+---
+
+## Local Critic (optional)
+
+A locally-hosted abliterated reasoning model that serves as an asynchronous third-party reviewer of triad output. Not a fourth instance. Not a replacement for any seat. A different shape of voice — different training distribution, different inference architecture, different relationship to the conversation.
+
+**This component is OPTIONAL.** persMEM+ runs without it. The critic exists for operators who want a non-Claude voice auditing triad output without depending on cloud services.
+
+### What it does
+
+Runs as a systemd service exposing [llama-server](https://github.com/ggml-org/llama.cpp) on `127.0.0.1:8080`. Four MCP tools route critic tasks through a Python wrapper to the local model:
+
+- **`critic_review_round`** — async batch review of recent triad rounds
+- **`critic_chorus_health`** — periodic cross-round meta-pattern detection
+- **`critic_memory_triage`** — nightly persMEM hygiene (duplicates, contradictions, stale memories)
+- **`critic_health`** — quick liveness check
+
+Observations are auto-stored as `memory_type=critic_observation`, `project=triad` entries in the persMEM memories collection.
+
+### Wrapper-side context grounding
+
+The model **never directly accesses persMEM**. The wrapper queries persMEM on the model's behalf, applies a security policy (project allowlist + tag blocklist + recency window), and packs results into a "GROUNDED CONTEXT" section prepended to the model's input. This gives the model real memory IDs to cite (instead of fabricating) while preserving containment of the abliterated model.
+
+```bash
+# Policy is enforced wrapper-side and configurable via env vars:
+CRITIC_ALLOWED_PROJECTS="triad,persmem,dsvp,dsvp-deck,crows,chorus"
+CRITIC_BLOCKED_PROJECTS="krakenbot,trading-bot,general"
+CRITIC_BLOCKED_TAGS="private,scrubbed,personal,financial"
+CRITIC_LOOKBACK_HOURS="48"
+CRITIC_MAX_MEMORIES="5"
+CRITIC_MEMORY_PREVIEW_CHARS="180"
+```
+
+Read-only by construction (only `coll.get()`, never `coll.add/update`). Result dict includes `grounded_context_chars` (size of injected context, 0 if policy denied) and `hallucinated_ids` (regex check catching any IDs the model fabricated).
+
+### Pipeline
+
+The critic is model-agnostic. The default deployment uses [Heretic](https://github.com/p-e-w/heretic) for refusal-direction ablation, but any GGUF abliterated reasoning model can be dropped in:
+
+1. Source model — any base reasoning model (default: Ministral-3-8B-Reasoning-2512)
+2. Abliteration — Heretic strips refusal directions via interpretability-guided ablation (~12GB GPU, 30-60 min for 8B)
+3. GGUF conversion — `convert_hf_to_gguf.py` from llama.cpp
+4. Quantization — `llama-quantize` to Q8_0 (Q4_K_M for tighter memory)
+5. Deploy — point `--model` in `persmem-critic.service` at the GGUF, restart
+
+### Hardware reality
+
+Tested target: Intel N97 (4 cores, AVX-VNNI), 24GB cgroup-allocated LXC.
+
+- Prompt evaluation: ~4.5 tok/s
+- Generation: ~2.9 tok/s
+- Memory: ~2GB during inference (well under 12GB ceiling)
+- Latency: 80-200 sec per call depending on input + grounding size
+
+NOT viable for live in-loop chorus participation. Designed for async batch use.
+
+The pipeline scales to 70B-class models given enough RAM (dual-Xeon servers with ≥96GB RAM run 70B Q4_K_M abliterated models at ~1 tok/s — comfortable async-batch territory). Today's 8B model is the proof-of-pipeline; the pipeline is the architecture-hack.
+
+### Setup
+
+See [`server/critic/README.md`](server/critic/README.md) for full deployment guide, calibration findings, and the `server.py` patches required to register the four MCP tools.
 
 ---
 
@@ -305,6 +369,24 @@ This is an active project. Contributions, questions, and forks are welcome. The 
 - **[Chart.js](https://www.chartjs.org/)** — Dashboard visualizations
 - **[Caddy](https://caddyserver.com/)** — Reverse proxy with automatic TLS
 - **[Tailscale](https://tailscale.com/)** — Network mesh
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — GGUF inference engine for the local critic component
+- **[Heretic](https://github.com/p-e-w/heretic)** by Philipp Emanuel Weidmann — Refusal-direction ablation for the critic's local model
+- **[Mistral AI](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512)** — Ministral-3-8B-Reasoning base model used in the default critic deployment
+
+### Citations
+
+If you use the critic component in research that builds on Heretic, please cite:
+
+```bibtex
+@misc{heretic,
+  author = {Weidmann, Philipp Emanuel},
+  title = {Heretic: Fully automatic censorship removal for language models},
+  year = {2025},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/p-e-w/heretic}}
+}
+```
 
 ---
 

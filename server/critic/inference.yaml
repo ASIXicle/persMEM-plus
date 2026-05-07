@@ -1,0 +1,23 @@
+# Inference parameters for the persMEM critic model.
+# Loaded by critic_client.py at request time.
+# Format: flat key:value pairs. Comments start with #.
+
+# Lower than the typical 0.8 default — reduces variance toward common
+# training-distribution stock phrases (the helpful-assistant residue).
+temperature: 0.5
+
+# Standard nucleus sampling.
+top_p: 0.9
+
+# Push the model away from common phrase grooves.
+# 1.0 = no penalty. 1.2+ starts producing awkward output. 1.18 is a sweet spot.
+repeat_penalty: 1.18
+
+# Hard cap on output length. The critic's observations should be terse —
+# 80-200 words for batch_review, less for chorus_health.
+# 512 tokens ≈ ~380 words, comfortable upper bound.
+max_tokens: 512
+
+# Stop sequences — terminate generation at common sign-off phrases the
+# model defaults to despite the system prompt.
+stop: ["</s>", "<|im_end|>", "[/INST]", "Let me know if", "Hope this helps", "Feel free to"]

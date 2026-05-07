@@ -1,0 +1,42 @@
+[Unit]
+Description=persMEM critic model — Ministral-3-8B-Reasoning-2512 abliterated (Q8_0)
+Documentation=https://github.com/ASIXicle/persMEM
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/persmem
+ExecStart=/opt/persmem/llama.cpp/build/bin/llama-server \
+  --model /opt/persmem/models/ministral-3-8b-reasoning-abliterated-Q8_0.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --threads 3 \
+  --ctx-size 8192 \
+  --batch-size 256 \
+  --n-predict 1024 \
+  --no-warmup \
+  --log-disable
+
+# Resource hygiene — keep ChromaDB alive on the same N97
+Nice=5
+CPUSchedulingPolicy=batch
+MemoryHigh=10G
+MemoryMax=12G
+
+# Restart policy — fail-soft, don't death-loop
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
