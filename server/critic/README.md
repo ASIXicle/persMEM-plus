@@ -137,8 +137,7 @@ server/critic/
    sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
      --comment "persMEM critic (abliterated llama-server)" critic
 
-   sudo chown -R root:critic /opt/persmem/models /opt/persmem/critic
-   sudo chmod -R g=rX,o= /opt/persmem/models /opt/persmem/critic
+   sudo chown root:critic /opt/persmem/models/your-abliterated-model-Q8_0.gguf          sudo chmod 0640 /opt/persmem/models/your-abliterated-model-Q8_0.gguf                 sudo chown -R root:critic /opt/persmem/critic                                        sudo chmod -R g=rX,o= /opt/persmem/critic
    sudo chgrp -R critic /opt/persmem/llama.cpp/build/bin
    sudo chmod g+rx /opt/persmem/llama.cpp/build/bin/llama-server
    ```
