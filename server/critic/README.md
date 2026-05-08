@@ -132,7 +132,19 @@ server/critic/
 
 3. **Edit `critic_client.py`** if your install paths differ from `/opt/persmem/critic/`.
 
-4. **Install the systemd service:**
+4. **Create the dedicated `critic` user and set file ownership.** Defense-in-depth for the abliterated model — the inference process gets read-only access to exactly the files it needs and nothing else:
+   ```bash
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
+     --comment "persMEM critic (abliterated llama-server)" critic
+
+   sudo chown -R root:critic /opt/persmem/models /opt/persmem/critic
+   sudo chmod -R g=rX,o= /opt/persmem/models /opt/persmem/critic
+   sudo chgrp -R critic /opt/persmem/llama.cpp/build/bin
+   sudo chmod g+rx /opt/persmem/llama.cpp/build/bin/llama-server
+   ```
+   Adjust paths if your install differs from `/opt/persmem`. The `g=rX` syntax (capital X) grants execute only on directories and already-executable files; the model GGUF gets `r--` for group, no execute.
+
+5. **Install the systemd service:**
    ```bash
    sudo cp persmem-critic.service /etc/systemd/system/
    sudo systemctl daemon-reload
@@ -141,16 +153,18 @@ server/critic/
    sudo journalctl -u persmem-critic -f  # watch boot
    ```
 
-5. **Verify llama-server is bound:**
+6. **Verify llama-server is running as `critic` and bound to localhost:**
    ```bash
+   ps -ef | grep llama-server  # user column should say 'critic', not 'root'
    curl -s http://127.0.0.1:8080/health
    ```
+   If the service fails to start with a SIGSYS or mmap-related error, comment out the `MemoryDenyWriteExecute=true` line in the unit file. Some llama.cpp builds need executable+writable memory mappings for quantized matmul kernels.
 
-6. **Patch `server.py`** with the policy config, helper functions, and four MCP tool definitions (see [Adding the MCP tools](#adding-the-mcp-tools) below) and restart the persMEM service.
+7. **Patch `server.py`** with the policy config, helper functions, and four MCP tool definitions (see [Adding the MCP tools](#adding-the-mcp-tools) below) and restart the persMEM service.
 
-7. **Refresh your MCP connector in claude.ai** — new tools require connector re-add.
+8. **Refresh your MCP connector in claude.ai** — new tools require connector re-add.
 
-8. **First test from a fresh tab:**
+9. **First test from a fresh tab:**
    ```python
    critic_health()  # should return {"status": "ok", "server_status": "ok"}
    ```
