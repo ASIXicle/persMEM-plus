@@ -37,6 +37,19 @@ HOST = "0.0.0.0"
 PORT = 9090
 PAGE_SIZE = 50
 
+# --- Critic infrastructure paths (optional component) ---
+# These point at the persMEM-critic service if deployed. If the critic
+# isn't installed, the /api/critic/* endpoints will return empty/unreachable
+# states gracefully — nothing in the core dashboard breaks.
+CRITIC_STATE_DIR = "/var/lib/persmem-critic"
+CRITIC_QUEUE_DIR = os.path.join(CRITIC_STATE_DIR, "queue")
+CRITIC_LAST_RUN_PATH = os.path.join(CRITIC_STATE_DIR, "last_run.json")
+CRITIC_LOCK_PATH = os.path.join(CRITIC_STATE_DIR, "lock")
+CRITIC_AUDIT_LOG = "/var/log/persmem-critic/audit.jsonl"
+LLAMA_HEALTH_URL = "http://127.0.0.1:8080/health"
+LLAMA_PROPS_URL = "http://127.0.0.1:8080/props"
+DISPATCHER_INTERVAL_MIN = 15  # systemd timer cadence
+
 app = Flask(__name__, static_folder="/opt/persmem-dashboard", static_url_path="/static")
 
 
@@ -1186,6 +1199,274 @@ def api_activity():
     amq_messages = get_amq_messages()
     activity = get_activity_data(memories, news_items, amq_messages)
     return no_cache(make_response(jsonify(activity)))
+
+
+# ============================
+# Optional: Local Critic endpoints
+# ============================
+# These endpoints expose the local-critic state to the dashboard if the
+# persmem-critic service is deployed (see server/critic/README.md).
+# They degrade gracefully when the critic isn't installed.
+
+def _read_jsonl_tail(path, n):
+    """Read up to n trailing lines of a JSONL file, parse each as JSON.
+    Returns oldest-to-newest. Lines that fail to parse are skipped silently."""
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-n:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def _critic_last_run_per_task():
+    """Read last_run.json, return {task: iso_ts} or empty dict."""
+    try:
+        with open(CRITIC_LAST_RUN_PATH, "r") as f:
+            return json.load(f)
+    except OSError:
+        return {}
+
+
+def _critic_queue_depth():
+    try:
+        return len([f for f in os.listdir(CRITIC_QUEUE_DIR) if f.endswith(".flag")])
+    except OSError:
+        return 0
+
+
+def _critic_lock_held():
+    """True if a worker currently holds the exclusive flock on the lock file.
+    The lock file persists between runs (it's a sentinel for fcntl.flock).
+    Probe with a non-blocking shared lock — blocked iff someone holds LOCK_EX."""
+    import fcntl
+    try:
+        fd = os.open(CRITIC_LOCK_PATH, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+    finally:
+        os.close(fd)
+
+
+def _critic_next_dispatcher_fire_iso():
+    """Next 15-min boundary where the systemd timer fires."""
+    now = datetime.now(timezone.utc)
+    minute = (now.minute // DISPATCHER_INTERVAL_MIN + 1) * DISPATCHER_INTERVAL_MIN
+    if minute >= 60:
+        nxt = now.replace(minute=0, second=0, microsecond=0)
+        nxt = nxt.replace(hour=(nxt.hour + 1) % 24)
+    else:
+        nxt = now.replace(minute=minute, second=0, microsecond=0)
+    return nxt.isoformat()
+
+
+def _llama_health():
+    """Quick health probe of llama-server. Returns dict (always)."""
+    try:
+        from urllib.request import urlopen
+        with urlopen(LLAMA_HEALTH_URL, timeout=2) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        return {"status": "unreachable", "error": str(e)[:200]}
+
+
+@app.route("/api/project_type")
+def api_project_type():
+    """Nested project->type counts for treemap visualization."""
+    memories = get_all_from_collection("memories")
+    nested = {}
+    for m in memories:
+        proj = m.get("project", "general")
+        mtype = m.get("type", "note")
+        nested.setdefault(proj, {})
+        nested[proj][mtype] = nested[proj].get(mtype, 0) + 1
+    return no_cache(make_response(jsonify(nested)))
+
+
+@app.route("/api/critic/observations")
+def api_critic_observations():
+    """Critic observation memories (type=critic_observation), newest first."""
+    memories = get_all_from_collection("memories")
+    obs = [m for m in memories if m.get("type") == "critic_observation"]
+    obs.sort(key=lambda m: m.get("stored_at", ""), reverse=True)
+    n = request.args.get("n", default=50, type=int)
+    n = max(1, min(n, 500))
+    return no_cache(make_response(jsonify(obs[:n])))
+
+
+@app.route("/api/critic/audit")
+def api_critic_audit():
+    """Tail of the JSONL audit log. ?n=50 default, max 500."""
+    n = request.args.get("n", default=50, type=int)
+    n = max(1, min(n, 500))
+    entries = _read_jsonl_tail(CRITIC_AUDIT_LOG, n)
+    return no_cache(make_response(jsonify(entries)))
+
+
+@app.route("/api/critic/failures")
+def api_critic_failures():
+    """Failed critic runs (status != ok). Last 50 from up to 500 audit entries."""
+    entries = _read_jsonl_tail(CRITIC_AUDIT_LOG, 500)
+    fails = [e for e in entries if e.get("status") != "ok"]
+    return no_cache(make_response(jsonify(fails[-50:])))
+
+
+@app.route("/api/critic/cron")
+def api_critic_cron():
+    """Cron state: last run, next dispatcher fire, queue depth, lock status."""
+    last_run_map = _critic_last_run_per_task()
+    recent = _read_jsonl_tail(CRITIC_AUDIT_LOG, 1)
+    last_run_obj = recent[0] if recent else None
+    return no_cache(make_response(jsonify({
+        "schedule": "memory_triage 24h auto; chorus_health + batch_review manual-only (Critic v2)",
+        "last_run": last_run_obj,
+        "last_run_per_task": last_run_map,
+        "next_run": _critic_next_dispatcher_fire_iso(),
+        "queue_depth": _critic_queue_depth(),
+        "in_progress": _critic_lock_held(),
+        "last_status": last_run_obj.get("status") if last_run_obj else None,
+    })))
+
+
+@app.route("/api/critic/llama")
+def api_critic_llama():
+    """Llama-server health probe + audit-derived request stats."""
+    health = _llama_health()
+    audit = _read_jsonl_tail(CRITIC_AUDIT_LOG, 500)
+    today = datetime.now(timezone.utc).date().isoformat()
+    today_count = sum(1 for e in audit if e.get("ts", "").startswith(today))
+    ok_lats = sorted(e.get("latency_sec", 0) for e in audit if e.get("status") == "ok")
+    p50 = ok_lats[len(ok_lats) // 2] if ok_lats else 0
+    p95 = ok_lats[int(len(ok_lats) * 0.95)] if len(ok_lats) > 1 else 0
+    reachable = health.get("status") not in (None, "unreachable")
+    return no_cache(make_response(jsonify({
+        "status": "running" if reachable else "unreachable",
+        "raw_health": health,
+        "requests_today": today_count,
+        "requests_total": len(audit),
+        "median_latency_sec": round(p50, 2),
+        "p95_latency_sec": round(p95, 2),
+    })))
+
+
+@app.route("/api/critic/trigger", methods=["POST"])
+def api_critic_trigger():
+    """Manually queue a critic task by writing a flag file to the queue dir.
+    Body: {"task": "chorus_health"|"memory_triage", "input": optional, "requested_by": optional}
+
+    Critic v2 (May 2026): demand-driven trigger. Cron timer is disabled by default;
+    manual fires drain the queue immediately via a detached worker subprocess.
+    cron_wrapper.py uses flock so concurrent triggers are serialized safely.
+    """
+    data = request.get_json(silent=True) or {}
+    task = data.get("task")
+    if task not in ("chorus_health", "memory_triage"):
+        return jsonify({"ok": False, "error": "task must be chorus_health or memory_triage"}), 400
+    now = datetime.now(timezone.utc)
+    flag_id = f"manual-{now.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    flag_path = os.path.join(CRITIC_QUEUE_DIR, f"{flag_id}.flag")
+    payload = {
+        "task": task,
+        "input": data.get("input"),
+        "requested_at": now.isoformat(),
+        "requested_by": data.get("requested_by", "dashboard"),
+    }
+    try:
+        os.makedirs(CRITIC_QUEUE_DIR, exist_ok=True)
+        with open(flag_path, "w") as f:
+            json.dump(payload, f)
+        worker_spawn_error = ""
+        try:
+            subprocess.Popen(
+                ["/opt/persmem/venv/bin/python3", "/opt/persmem/cron_wrapper.py"],
+                cwd="/opt/persmem",
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            worker_spawn_error = f"worker spawn failed: {e}"
+        resp = {"ok": True, "flag_id": flag_id, "path": flag_path}
+        if worker_spawn_error:
+            resp["warning"] = worker_spawn_error
+        return jsonify(resp)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# Chat-with-the-critic — streams llama-server SSE to the browser.
+# llama-server (port 8080) exposes /v1/chat/completions OpenAI-compatible endpoint
+# with stream:True. We proxy the SSE bytes through unchanged so the frontend can
+# consume the standard OpenAI streaming format (data: {...}\n\n).
+_CHAT_SYSTEM_PROMPTS = {
+    "general": "You are the persMEM critic. Be concise, factual, and observational. No preamble. Surface what's interesting or wrong, then stop.",
+    "chorus_health": "You are reviewing triad coherence. Look for consensus collapse (instances agreeing without testing), premise-not-tested patterns, repeating failure modes, normalized assumptions. Be direct.",
+    "batch_review": "You are reviewing a batch of recent memories for grounding quality. Flag bare assertions, missing source citations, retros without quoted log lines.",
+    "memory_triage": "You are flagging stale, duplicate, or contradicting memories for retraction review. Output candidates with brief reasoning.",
+}
+
+
+@app.route("/api/critic/prompt", methods=["POST"])
+def api_critic_prompt():
+    """Streaming proxy to llama-server. Body: {prompt, task?, max_tokens?}.
+    Returns text/event-stream of SSE chunks from llama-server."""
+    import urllib.request as _urlreq
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    task = data.get("task", "general")
+    max_tokens = int(data.get("max_tokens", 800))
+    if not prompt:
+        return jsonify({"ok": False, "error": "empty prompt"}), 400
+
+    sys_prompt = _CHAT_SYSTEM_PROMPTS.get(task, _CHAT_SYSTEM_PROMPTS["general"])
+    upstream_payload = {
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": True,
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
+
+    def generate():
+        try:
+            req = _urlreq.Request(
+                "http://127.0.0.1:8080/v1/chat/completions",
+                data=json.dumps(upstream_payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with _urlreq.urlopen(req, timeout=300) as resp:
+                while True:
+                    chunk = resp.read(1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        except Exception as e:
+            err = json.dumps({"error": str(e)[:300]})
+            yield f"data: {err}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+    return Response(generate(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # disable buffering on any reverse proxy
+    })
 
 
 if __name__ == "__main__":

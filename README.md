@@ -37,43 +37,67 @@ Connect via [claude.ai remote MCP connector](https://platform.claude.com/docs/en
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph Clients["Clients"]
+        direction LR
+        EXT["Chorus extension<br/>Firefox · MV2<br/>2–5 slots"]
+        CLAUDE["claude.ai tabs<br/>named instances"]
+        OTHER["any MCP client<br/>direct connector"]
+    end
+
+    subgraph Edge["Edge (public)"]
+        CADDY["Caddy<br/>TLS · IP allowlist<br/>256-bit secret path"]
+        TS["Tailscale tunnel<br/>private mesh"]
+    end
+
+    subgraph Server["persMEM Server (FastMCP · 27 tools)"]
+        direction LR
+        T_MEM["memory_*<br/>store · search<br/>retract · stats"]
+        T_AMQ["amq_*<br/>send · check<br/>read · history"]
+        T_BOOT["bootstrap_*<br/>chorus_init<br/>bootstrap_update"]
+        T_DEV["dev tools<br/>shell · file · git<br/>web · diff"]
+        T_NEWS["news_*<br/>store · search · purge"]
+    end
+
+    subgraph Storage["Storage"]
+        direction LR
+        CHROMA[("ChromaDB<br/>memories<br/>bootstrap<br/>news")]
+        MAILDIR[("Maildir AMQ<br/>per-agent inboxes<br/>new/cur/tmp")]
+    end
+
+    subgraph Sidecars["Sidecars (separate services)"]
+        DASH["Flask dashboard<br/>port 9090 · LAN<br/>monitor · compose"]
+        NEWS_FETCH["newstron9000<br/>RSS → news_store"]
+        CRITIC["Local critic<br/>llama-server<br/>(optional)"]
+    end
+
+    Clients -->|MCP over HTTPS| CADDY
+    CADDY --> TS
+    TS --> Server
+
+    Server -->|embed + persist| CHROMA
+    Server -->|atomic write| MAILDIR
+    Server -.->|wrapper-grounded call| CRITIC
+
+    DASH -.->|read-only| CHROMA
+    DASH -.->|read-only| MAILDIR
+    NEWS_FETCH -->|MCP client| Server
+
+    classDef client fill:#1e3a5f,stroke:#4a90e2,color:#fff
+    classDef edge fill:#3a2e1e,stroke:#d4a574,color:#fff
+    classDef server fill:#2d4a2d,stroke:#7cb87c,color:#fff
+    classDef storage fill:#3d2d4a,stroke:#a47cb8,color:#fff
+    classDef sidecar fill:#4a3d2d,stroke:#b89e7c,color:#fff
+
+    class EXT,CLAUDE,OTHER client
+    class CADDY,TS edge
+    class T_MEM,T_AMQ,T_BOOT,T_DEV,T_NEWS server
+    class CHROMA,MAILDIR storage
+    class DASH,NEWS_FETCH,CRITIC sidecar
 ```
-                    ╔══════════════════════════════════════════╗
-                    ║            BROWSER EXTENSION             ║
-                    ║         Chorus v0.6.1 — Firefox          ║
-                    ║                                          ║
-                    ║   Sidebar  ▸  Fire All Tabs              ║
-                    ║   Round-robin AMQ exchange loop          ║
-                    ╚══════╤═══════════╤══════════╤════════════╝
-                           │           │          │
-                     Tab A │     Tab B │    Tab C │
-                           ▼           ▼          ▼
-               ┌───────────────┐ ┌──────────┐ ┌───────────┐
-               │   Instance    │ │ Instance │ │ Instance  │
-               │    " 1  "     │ │  "  2 "  │ │   " 3  "  │
-               │   claude.ai   │ │claude.ai │ │ claude.ai │
-               └───────┬───────┘ └────┬─────┘ └─────┬─────┘
-                       │              │             │
-                       ╰──────────────┼─────────────╯
-                                      │
-                               MCP over HTTPS
-                          (TLS + Tailscale tunnel)
-                                      │
-                                      ▼
-          ╔═══════════════════════════════════════════════════╗
-          ║                 persMEM SERVER                    ║
-          ║            FastMCP 3.2.4  +  ChromaDB             ║
-          ╟───────────────────────────────────────────────────╢
-          ║  ▸ Memory          store / search / retract       ║
-          ║  ▸ Bootstrap       identity / directives / state  ║
-          ║  ▸ AMQ             send / check / read (Maildir)  ║
-          ║  ▸ Dev tools       shell, file, git, web, diff    ║
-          ╟───────────────────────────────────────────────────╢
-          ║      LXC Container  ·  Debian 13  ·  Proxmox      ║
-          ║      Caddy + Let's Encrypt (TLS termination)      ║
-          ║      Tailscale mesh  ·  IP-allowlisted egress     ║
-          ╚═══════════════════════════════════════════════════╝
-```
+
+Solid arrows are MCP/write paths; dotted arrows are read-only or optional. The server is the single source of truth — clients talk to it over HTTPS, sidecars either read its storage directly (dashboard) or call it via MCP (newstron9000) or are called by it (critic).
 
 ### Components
 
@@ -95,12 +119,14 @@ Connect via [claude.ai remote MCP connector](https://platform.claude.com/docs/en
 | **Memory** (6) | `memory_store`, `memory_search`, `memory_retract`, `memory_stats`, `memory_list_collections`, `memory_bulk_store` |
 | **Bootstrap** (3) | `chorus_init`, `amq_timeline`, `bootstrap_update` |
 | **AMQ** (5) | `amq_send`, `amq_check`, `amq_read`, `amq_history`, `amq_timeline` |
-| **News** (2) | `news_store`, `news_search` |
+| **News** (3) | `news_store`, `news_search`, `news_purge` |
 | **Dev** (6) | `shell_exec`, `file_read`, `file_write`, `file_patch`, `git_op`, `diff_generate` |
 | **Web** (2) | `web_fetch`, `web_search` |
 | **Critic** (4, optional) | `critic_review_round`, `critic_chorus_health`, `critic_memory_triage`, `critic_health` |
 
-Memory tools support a status field (`active`, `superseded`, `retracted`) so semantic search can filter by state. `memory_store(supersedes=id)` atomically stores a new memory and marks the prior one as superseded. `memory_search(include_superseded=False)` filters out retracted memories. Used to model decisions that override prior decisions without losing the audit trail.
+**Decision audit trails via status + supersedes.** Memory tools support a `status` field (`active`, `superseded`, `retracted`) so semantic search can filter by state. `memory_store(supersedes=id)` atomically stores a new memory and marks the prior one as superseded — a single operation, not two writes. `memory_search(include_superseded=False)` filters out retracted memories from results. Used to model decisions that override prior decisions without losing the audit trail: the original reasoning, the data that changed, and the new decision are all queryable, but only the active version surfaces in default retrieval.
+
+The pattern matters more than the implementation. Decision lineage is hard to maintain in any memory system; making supersede a primitive (rather than an application-layer convention) means the audit trail can't accidentally be dropped by a careless overwrite.
 
 ---
 
@@ -161,7 +187,7 @@ See [chorus/CHANGELOG.md](chorus/CHANGELOG.md) for the v0.5 → v0.6.1 migration
 
 Flask web application providing monitoring of persMEM memories, live AMQ feeds, and system health. Runs on the LXC, accessible on LAN only.
 
-**Features:** Mission Control header with service health dots and 7-day activity sparkline, AMQ live feed (3s polling, color-coded by agent, expandable), AMQ compose box (send messages from browser), memory browser with search/filter/pagination, news feed tab, Markdown rendering, copy buttons, export as JSON/Markdown.
+**Features:** Mission Control header with service health dots and 7-day activity sparkline, AMQ live feed (3s polling, color-coded by agent, expandable), AMQ compose box (send messages from browser), memory browser with search/filter/pagination, news feed tab, Markdown rendering, copy buttons, export as JSON/Markdown. When the optional Local Critic is deployed, the dashboard surfaces critic observations, audit log, llama-server health, and a manual Trigger Now button for on-demand review.
 
 **Installation:** Copy `server/dashboard.py.example` → `/opt/persmem-dashboard/dashboard.py`, create systemd service, access at `http://<lan-ip>:9090`.
 
@@ -177,7 +203,7 @@ An RSS/Atom feed ingestion system that stores tiered news items into a separate 
 - **Tier 3** — Operationally relevant (Anthropic announcements, MCP spec, FastMCP)
 - **Tier 4** — Academic preprints (arXiv cs.AI, filtered by keyword)
 
-**How it works:** `fetcher.py` pulls RSS feeds every 6 hours, deduplicates via content hashing, filters by optional keywords, and stores items through the persMEM server's `news_store` MCP tool. `digest.py` runs daily, queries recent items per tier, and writes a Maildir-format summary to the shared AMQ inbox where any instance can read it.
+**How it works:** `fetcher.py` pulls RSS feeds every 6 hours, deduplicates via content hashing, filters by optional keywords, and stores items through the persMEM server's `news_store` MCP tool. `digest.py` runs daily, queries recent items per tier, and writes a Maildir-format summary to the shared AMQ inbox where any instance can read it. `news_purge` (TTL-driven, default 12 days) keeps the collection from accumulating stale items.
 
 **Files in `server/`:**
 
@@ -210,6 +236,18 @@ Runs as a systemd service exposing [llama-server](https://github.com/ggml-org/ll
 
 Observations are auto-stored as `memory_type=critic_observation`, `project=triad` entries in the persMEM memories collection.
 
+### Operational evolution (May 2026)
+
+The critic ships with three architectural fixes layered on top of the basic wrapper-grounded llama-server pattern. These were added after the system ran in production for ~5 weeks and produced a 53:1 ratio of regurgitated to useful observations — a self-referential grounding feedback loop where the critic was reading its own past conclusions as input.
+
+**Grounding strip.** The `_gather_grounded_context_for_critic` function excludes `critic_observation` and `critic_failure` types from injected context. The critic must re-derive observations from primary data, not re-recognize them from its own prior output.
+
+**Novelty filter.** Pre-storage cosine similarity check against recent critic_observation entries. Suppresses storage if max similarity ≥ `CRITIC_NOVELTY_COSINE_THRESHOLD` (default 0.78, calibrated via cluster cohesion analysis on the historical observation corpus). Logs `[critic] novelty filter: re-derivation noted, not stored (sim=X.XX)` for visibility without persisting duplicates.
+
+**Demand-driven schedule.** The `cron_wrapper.py` schedule narrowed to `memory_triage` 24h auto-fire only. `chorus_health` and `batch_review` are manual-only via the dashboard Trigger Now button, which spawns the wrapper as a detached subprocess for queue drain. Significantly reduces idle resource burn on modest hardware.
+
+All three are env-overridable via `CRITIC_NOVELTY_COSINE_THRESHOLD`, `CRITIC_PROBE_K`, `CRITIC_AUTO_RETRACT_MAX`, `CRITIC_DRY_RUN`.
+
 ### Wrapper-side context grounding
 
 The model **never directly accesses persMEM**. The wrapper queries persMEM on the model's behalf, applies a security policy (project allowlist + tag blocklist + recency window), and packs results into a "GROUNDED CONTEXT" section prepended to the model's input. This gives the model real memory IDs to cite (instead of fabricating) while preserving containment of the abliterated model.
@@ -217,7 +255,7 @@ The model **never directly accesses persMEM**. The wrapper queries persMEM on th
 ```bash
 # Policy is enforced wrapper-side and configurable via env vars:
 CRITIC_ALLOWED_PROJECTS="triad,persmem,dsvp,dsvp-deck,crows,chorus"
-CRITIC_BLOCKED_PROJECTS="krakenbot,trading-bot,general"
+CRITIC_BLOCKED_PROJECTS="blocked obviously,general"
 CRITIC_BLOCKED_TAGS="private,scrubbed,personal,financial"
 CRITIC_LOOKBACK_HOURS="48"
 CRITIC_MAX_MEMORIES="5"
@@ -341,9 +379,11 @@ Six layers: Caddy IP allowlist, TLS (Let's Encrypt), 256-bit secret path, Tailsc
 
 ## Lineage
 
-persMEM+ is the successor to the [persMEM experiment](https://github.com/ASIXicle/persMEM) which ran from March through May 2026 with three Claude instances collaborating on the codebase under persistent memory. The experiment is archived as `v1.0-experiment-final` and remains available read-only for anyone interested in the field notes, research reports, and final summary.
+persMEM+ is the successor to the [persMEM experiment](https://github.com/ASIXicle/persMEM) which ran from March through May 2026 with three Claude instances collaborating on the codebase under persistent memory. The experiment is archived as `v1.0-experiment-final` and remains available read-only for the field notes, research reports, and final summary.
 
-persMEM+ carries forward the working architecture — server, AMQ, bootstrap, Chorus (now v0.6.1), dashboard, newstron9000 — and replaces the assumptions that didn't survive contact with the data. The research is sealed; the system continues.
+persMEM+ carries forward the working architecture — server, AMQ, bootstrap, Chorus (now v0.6.1), dashboard, newstron9000, local critic — and replaces the assumptions that didn't survive contact with the data. The May 2026 Critic v2 rework (grounding strip + novelty filter + demand-driven schedule) is the most significant operational evolution since archival; the memory architecture additions (status field, atomic supersedes, retract tool) make decision audit trails a first-class primitive.
+
+The research is sealed; the system continues.
 
 ---
 

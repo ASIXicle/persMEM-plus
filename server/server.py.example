@@ -13,7 +13,7 @@ import hashlib
 import time
 import shlex
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import chromadb
@@ -81,6 +81,7 @@ def memory_store(
     tags: str = "",
     memory_type: str = "session_note",
     collection: str = DEFAULT_COLLECTION,
+    supersedes: str = "",
 ) -> str:
     """
     Store a memory chunk in the vector database.
@@ -94,6 +95,9 @@ def memory_store(
         memory_type: One of: session_summary, decision, bug, architecture,
                      code_change, insight, question, raw_note
         collection: ChromaDB collection name. Default: 'memories'.
+        supersedes: ID of a memory this one replaces. If provided, the old
+                    memory is auto-marked as superseded. Use for decisions
+                    that override prior decisions (e.g., ceiling 14h -> 6h).
     """
     now = datetime.now(timezone.utc).isoformat()
     chunk_id = make_id(content, now)
@@ -107,6 +111,9 @@ def memory_store(
         "type": memory_type,
         "stored_at": now,
         "char_count": len(content),
+        "status": "active",
+        "superseded_by": "",
+        "expires_at": "",
     }
 
     coll.add(
@@ -116,14 +123,96 @@ def memory_store(
         metadatas=[metadata],
     )
 
-    return json.dumps({
+    # Auto-retract the superseded memory if specified
+    retracted_id = ""
+    supersedes_warning = ""
+    if supersedes:
+        try:
+            old = coll.get(ids=[supersedes], include=["metadatas"])
+            if old["ids"]:
+                old_meta = old["metadatas"][0]
+                old_meta["status"] = "superseded"
+                old_meta["superseded_by"] = chunk_id
+                old_meta["superseded_at"] = now
+                coll.update(ids=[supersedes], metadatas=[old_meta])
+                retracted_id = supersedes
+            else:
+                supersedes_warning = (
+                    f"WARNING: supersedes target '{supersedes}' not found "
+                    "-- new memory stored but nothing retracted"
+                )
+        except Exception as e:
+            supersedes_warning = (
+                f"WARNING: retraction of '{supersedes}' failed ({e}) "
+                "-- new memory stored but old not retracted"
+            )
+
+    result = {
         "status": "stored",
         "id": chunk_id,
         "collection": collection,
         "project": project,
         "type": memory_type,
         "stored_at": now,
-    })
+        "supersedes": retracted_id,
+    }
+    if supersedes_warning:
+        result["warning"] = supersedes_warning
+
+    return json.dumps(result)
+
+
+@mcp.tool()
+def memory_retract(
+    memory_id: str,
+    reason: str = "",
+    superseded_by: str = "",
+    collection: str = DEFAULT_COLLECTION,
+) -> str:
+    """
+    Mark a memory as superseded/retracted. The memory stays in the
+    database but is flagged so search can annotate or filter it.
+
+    Use when a decision, spec, or finding has been overridden by
+    a newer one. Pairs with memory_store(supersedes=...) for
+    atomic store-and-retract.
+
+    Args:
+        memory_id: The ID of the memory to retract (from search results).
+        reason: Why this memory is being retracted (e.g., 'ceiling changed
+                from 14h to 6h based on Kraken-native data').
+        superseded_by: ID of the memory that replaces this one (optional).
+        collection: ChromaDB collection name. Default: 'memories'.
+    """
+    coll = get_or_create_collection(collection)
+
+    try:
+        existing = coll.get(ids=[memory_id], include=["metadatas", "documents"])
+        if not existing["ids"]:
+            return json.dumps({
+                "status": "error",
+                "message": f"Memory {memory_id} not found",
+            })
+
+        meta = existing["metadatas"][0]
+        now = datetime.now(timezone.utc).isoformat()
+        meta["status"] = "superseded"
+        meta["superseded_by"] = superseded_by
+        meta["superseded_at"] = now
+        if reason:
+            meta["retraction_reason"] = reason
+
+        coll.update(ids=[memory_id], metadatas=[meta])
+
+        return json.dumps({
+            "status": "retracted",
+            "id": memory_id,
+            "superseded_by": superseded_by,
+            "reason": reason,
+            "original_content_preview": existing["documents"][0][:200],
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
 
 
 @mcp.tool()
@@ -201,6 +290,7 @@ def memory_search(
     project: Optional[str] = None,
     memory_type: Optional[str] = None,
     collection: str = DEFAULT_COLLECTION,
+    include_superseded: bool = True,
 ) -> str:
     """
     Semantic search over stored memories. Returns the most relevant chunks.
@@ -211,6 +301,8 @@ def memory_search(
         project: Filter by project name. None = search all projects.
         memory_type: Filter by type. None = search all types.
         collection: ChromaDB collection name. Default: 'memories'.
+        include_superseded: If False, filter out memories marked as superseded.
+                            Default True for backward compatibility.
     """
     top_k = max(1, min(20, top_k))
     coll = get_or_create_collection(collection)
@@ -229,28 +321,49 @@ def memory_search(
 
     query_embedding = embed([query], mode="query")
 
+    # Request extra results if filtering superseded (to fill top_k after filter)
+    fetch_k = top_k * 2 if not include_superseded else top_k
+
     results = coll.query(
         query_embeddings=query_embedding,
-        n_results=top_k,
+        n_results=fetch_k,
         where=where if where else None,
         include=["documents", "metadatas", "distances"],
     )
 
-    # Format results
+    # Format results with supersession annotations
     chunks = []
     if results["ids"] and results["ids"][0]:
         for i, chunk_id in enumerate(results["ids"][0]):
-            chunks.append({
+            meta = results["metadatas"][0][i]
+            status = meta.get("status", "active")
+            is_superseded = status == "superseded"
+
+            # Filter if requested
+            if not include_superseded and is_superseded:
+                continue
+
+            chunk = {
                 "id": chunk_id,
                 "content": results["documents"][0][i],
-                "metadata": results["metadatas"][0][i],
+                "metadata": meta,
                 "similarity": round(1 - results["distances"][0][i], 4),
-            })
+                "superseded": is_superseded,
+            }
+            if is_superseded:
+                chunk["superseded_by"] = meta.get("superseded_by", "")
+                chunk["retraction_reason"] = meta.get("retraction_reason", "")
+
+            chunks.append(chunk)
+
+            if len(chunks) >= top_k:
+                break
 
     return json.dumps({
         "query": query,
         "collection": collection,
-        "filters": {"project": project, "type": memory_type},
+        "filters": {"project": project, "type": memory_type,
+                     "include_superseded": include_superseded},
         "count": len(chunks),
         "results": chunks,
     })
@@ -321,6 +434,48 @@ def news_search(
         "count": len(chunks),
         "results": chunks,
     })
+
+
+@mcp.tool()
+def news_purge(max_age_days: int = 12, dry_run: bool = True) -> str:
+    """Purge news entries older than max_age_days from the news collection.
+
+    Designed for scheduled cleanup (systemd timer) or manual invocation.
+    Default: 12-day TTL. Set dry_run=False to actually delete.
+
+    Args:
+        max_age_days: Maximum age in days before an entry is purged. Default 12.
+        dry_run: If True (default), report what would be deleted without deleting.
+    """
+    coll = get_or_create_collection("news")
+    all_entries = coll.get(include=["metadatas"])
+    if not all_entries["ids"]:
+        return json.dumps({"status": "empty", "message": "News collection is empty."})
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+
+    to_delete = []
+    for entry_id, meta in zip(all_entries["ids"], all_entries["metadatas"]):
+        stored_at = meta.get("stored_at", "")
+        if stored_at and stored_at < cutoff:
+            to_delete.append(entry_id)
+
+    total = len(all_entries["ids"])
+    stale = len(to_delete)
+
+    if stale == 0:
+        return json.dumps({"status": "clean", "total": total, "stale": 0,
+                           "max_age_days": max_age_days})
+
+    if dry_run:
+        return json.dumps({"status": "dry_run", "total": total, "stale": stale,
+                           "max_age_days": max_age_days,
+                           "message": f"{stale} entries older than {max_age_days} days. "
+                                      f"Set dry_run=False to purge."})
+
+    coll.delete(ids=to_delete)
+    return json.dumps({"status": "purged", "deleted": stale,
+                       "remaining": total - stale, "max_age_days": max_age_days})
 
 
 @mcp.tool()
