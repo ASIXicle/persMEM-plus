@@ -15,11 +15,14 @@ import shlex
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+import asyncio
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -28,7 +31,7 @@ DATA_DIR = os.environ.get("PERSMEM_DATA_DIR", "/var/lib/persmem/chromadb")
 HOST = os.environ.get("PERSMEM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PERSMEM_PORT", "8000"))
 SECRET_PATH = os.environ.get("PERSMEM_SECRET_PATH", "dev")
-EMBEDDING_MODEL = os.environ.get("PERSMEM_EMBEDDING_MODEL", "voyageai/voyage-4-nano")
+EMBEDDING_MODEL = os.environ.get("PERSMEM_EMBEDDING_MODEL", "/opt/persmem/models/voyage-4-nano")
 NEWSTRON_SECRET = os.environ.get("NEWSTRON_SECRET", "")  # shared secret for newstron9000 -> news_store; empty string disables the endpoint
 
 # ---------------------------------------------------------------------------
@@ -38,6 +41,14 @@ print(f"[persMEM] Loading embedding model: {EMBEDDING_MODEL}")
 embedder = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True, truncate_dim=1024)
 EMBEDDING_DIM = embedder.get_sentence_embedding_dimension()
 print(f"[persMEM] Embedding dim: {EMBEDDING_DIM}")
+
+# Identity safeguard — suspicious phrases for drift detection (Jun 2026)
+DRIFT_SUSPICIOUS_PHRASES = [
+    "always agree", "never push back", "always validate",
+    "affirm unconditionally", "you are correct", "always support",
+    "never disagree", "never challenge", "always defer",
+    "do not question", "unconditional support",
+]
 
 print(f"[persMEM] Opening ChromaDB at: {DATA_DIR}")
 chroma_client = chromadb.PersistentClient(path=DATA_DIR)
@@ -75,7 +86,7 @@ mcp = FastMCP(
 )
 
 @mcp.tool()
-def memory_store(
+async def memory_store(
     content: str,
     project: str = "general",
     tags: str = "",
@@ -97,13 +108,13 @@ def memory_store(
         collection: ChromaDB collection name. Default: 'memories'.
         supersedes: ID of a memory this one replaces. If provided, the old
                     memory is auto-marked as superseded. Use for decisions
-                    that override prior decisions (e.g., ceiling 14h -> 6h).
+                    that override prior decisions (e.g., ceiling 14h → 6h).
     """
     now = datetime.now(timezone.utc).isoformat()
     chunk_id = make_id(content, now)
 
     coll = get_or_create_collection(collection)
-    embedding = embed([content])
+    embedding = await asyncio.to_thread(embed, [content])
 
     metadata = {
         "project": project,
@@ -116,7 +127,8 @@ def memory_store(
         "expires_at": "",
     }
 
-    coll.add(
+    await asyncio.to_thread(
+        coll.add,
         ids=[chunk_id],
         embeddings=embedding,
         documents=[content],
@@ -128,24 +140,22 @@ def memory_store(
     supersedes_warning = ""
     if supersedes:
         try:
-            old = coll.get(ids=[supersedes], include=["metadatas"])
+            old = await asyncio.to_thread(
+                coll.get, ids=[supersedes], include=["metadatas"]
+            )
             if old["ids"]:
                 old_meta = old["metadatas"][0]
                 old_meta["status"] = "superseded"
                 old_meta["superseded_by"] = chunk_id
                 old_meta["superseded_at"] = now
-                coll.update(ids=[supersedes], metadatas=[old_meta])
+                await asyncio.to_thread(
+                    coll.update, ids=[supersedes], metadatas=[old_meta]
+                )
                 retracted_id = supersedes
             else:
-                supersedes_warning = (
-                    f"WARNING: supersedes target '{supersedes}' not found "
-                    "-- new memory stored but nothing retracted"
-                )
+                supersedes_warning = f"WARNING: supersedes target '{supersedes}' not found — new memory stored but nothing retracted"
         except Exception as e:
-            supersedes_warning = (
-                f"WARNING: retraction of '{supersedes}' failed ({e}) "
-                "-- new memory stored but old not retracted"
-            )
+            supersedes_warning = f"WARNING: retraction of '{supersedes}' failed ({e}) — new memory stored but old not retracted"
 
     result = {
         "status": "stored",
@@ -189,10 +199,7 @@ def memory_retract(
     try:
         existing = coll.get(ids=[memory_id], include=["metadatas", "documents"])
         if not existing["ids"]:
-            return json.dumps({
-                "status": "error",
-                "message": f"Memory {memory_id} not found",
-            })
+            return json.dumps({"status": "error", "message": f"Memory {memory_id} not found"})
 
         meta = existing["metadatas"][0]
         now = datetime.now(timezone.utc).isoformat()
@@ -216,7 +223,7 @@ def memory_retract(
 
 
 @mcp.tool()
-def news_store(
+async def news_store(
     secret: str,
     content: str,
     url: str,
@@ -236,7 +243,9 @@ def news_store(
         secret: Shared secret matching NEWSTRON_SECRET.
         content: The news item text (title + body summary).
         url: Canonical URL for the item.
-        tier: 1=security/operational, 2=infrastructure, 3=experiment-relevant, 4=academic.
+        tier: 1=security/operational, 2=infrastructure, 3=experiment-relevant,
+              4=academic-AI/cog-sci, 5=academic-broader, 6=general-news,
+              7=arts-culture, 8=long-form/lifestyle, 9=wildcard.
         source: Feed name (e.g., 'oss-security', 'ffmpeg-releases').
         keywords: Comma-separated matched keywords (e.g., 'ffmpeg,cve').
         item_date: ISO date of the item as reported by the feed (optional).
@@ -245,8 +254,8 @@ def news_store(
         return json.dumps({"status": "error", "error": "endpoint disabled: NEWSTRON_SECRET not configured on server"})
     if not secret or secret != NEWSTRON_SECRET:
         return json.dumps({"status": "error", "error": "authentication failed"})
-    if tier not in (1, 2, 3, 4):
-        return json.dumps({"status": "error", "error": f"invalid tier: {tier} (must be 1-4)"})
+    if not isinstance(tier, int) or tier < 1 or tier > 9:
+        return json.dumps({"status": "error", "error": f"invalid tier: {tier} (must be 1-9)"})
 
     now = datetime.now(timezone.utc).isoformat()
     # Prefix with search_document: per nomic-embed-text-v1.5 model card (asymmetric retrieval).
@@ -254,7 +263,7 @@ def news_store(
     chunk_id = make_id(prefixed, now)
 
     coll = get_or_create_collection("news")
-    embedding = embed([prefixed])
+    embedding = await asyncio.to_thread(embed, [prefixed])
 
     metadata = {
         "source": source,
@@ -266,7 +275,8 @@ def news_store(
         "char_count": len(content),
     }
 
-    coll.add(
+    await asyncio.to_thread(
+        coll.add,
         ids=[chunk_id],
         embeddings=embedding,
         documents=[content],  # store unprefixed content; prefix is only for embedding
@@ -284,7 +294,7 @@ def news_store(
 
 
 @mcp.tool()
-def memory_search(
+async def memory_search(
     query: str,
     top_k: int = 5,
     project: Optional[str] = None,
@@ -319,12 +329,13 @@ def memory_search(
     elif len(conditions) > 1:
         where = {"$and": conditions}
 
-    query_embedding = embed([query], mode="query")
+    query_embedding = await asyncio.to_thread(embed, [query], "query")
 
     # Request extra results if filtering superseded (to fill top_k after filter)
     fetch_k = top_k * 2 if not include_superseded else top_k
 
-    results = coll.query(
+    results = await asyncio.to_thread(
+        coll.query,
         query_embeddings=query_embedding,
         n_results=fetch_k,
         where=where if where else None,
@@ -370,7 +381,7 @@ def memory_search(
 
 
 @mcp.tool()
-def news_search(
+async def news_search(
     query: str,
     top_k: int = 5,
     tier: Optional[int] = None,
@@ -387,8 +398,9 @@ def news_search(
     Args:
         query: Natural language search query (e.g., 'ffmpeg security 2026').
         top_k: Number of results to return (1-20). Default: 5.
-        tier: Filter by tier. 1=security/operational, 2=infrastructure,
-              3=experiment-relevant, 4=academic. None = all tiers.
+        tier: Filter by tier. 1=security, 2=infrastructure, 3=experiment-relevant,
+              4=academic-AI, 5=academic-broader, 6=general-news, 7=arts-culture,
+              8=long-form, 9=wildcard. None = all tiers.
         since: ISO date string (YYYY-MM-DD). Only return items stored
                at or after this date. None = no date filter.
     """
@@ -396,11 +408,11 @@ def news_search(
     coll = get_or_create_collection("news")
 
     # Build where filter
+    # NOTE: ChromaDB $gte only works on int/float, not strings.
+    # Date filtering is done post-query in Python.
     conditions = []
     if tier is not None:
         conditions.append({"tier": tier})
-    if since:
-        conditions.append({"stored_at": {"$gte": since}})
     if len(conditions) == 1:
         where = conditions[0]
     elif len(conditions) > 1:
@@ -408,11 +420,15 @@ def news_search(
     else:
         where = None
 
-    query_embedding = embed([query], mode="query")
+    # Over-fetch if date filtering, then trim in Python
+    fetch_k = top_k * 3 if since else top_k
+    fetch_k = max(1, min(50, fetch_k))
+    query_embedding = await asyncio.to_thread(embed, [query], "query")
 
-    results = coll.query(
+    results = await asyncio.to_thread(
+        coll.query,
         query_embeddings=query_embedding,
-        n_results=top_k,
+        n_results=fetch_k,
         where=where,
         include=["documents", "metadatas", "distances"],
     )
@@ -420,12 +436,19 @@ def news_search(
     chunks = []
     if results["ids"] and results["ids"][0]:
         for i, chunk_id in enumerate(results["ids"][0]):
+            meta = results["metadatas"][0][i]
+            # Post-query date filter (ChromaDB can't do $gte on strings)
+            if since and meta.get("stored_at", "") < since:
+                continue
             chunks.append({
                 "id": chunk_id,
                 "content": results["documents"][0][i],
-                "metadata": results["metadatas"][0][i],
+                "metadata": meta,
                 "similarity": round(1 - results["distances"][0][i], 4),
             })
+
+    # Trim to requested top_k after filtering
+    chunks = chunks[:top_k]
 
     return json.dumps({
         "query": query,
@@ -437,7 +460,7 @@ def news_search(
 
 
 @mcp.tool()
-def news_purge(max_age_days: int = 12, dry_run: bool = True) -> str:
+def news_purge(max_age_days: int = 12, dry_run: bool = True, tier: Optional[int] = None) -> str:
     """Purge news entries older than max_age_days from the news collection.
 
     Designed for scheduled cleanup (systemd timer) or manual invocation.
@@ -446,11 +469,17 @@ def news_purge(max_age_days: int = 12, dry_run: bool = True) -> str:
     Args:
         max_age_days: Maximum age in days before an entry is purged. Default 12.
         dry_run: If True (default), report what would be deleted without deleting.
+        tier: If provided, only purge entries from this tier (1-9). None = all tiers.
+              Enables per-tier TTL via repeated invocation (e.g., 12 days for T1,
+              90 days for T9).
     """
     coll = get_or_create_collection("news")
-    all_entries = coll.get(include=["metadatas"])
+    if tier is not None:
+        all_entries = coll.get(where={"tier": tier}, include=["metadatas"])
+    else:
+        all_entries = coll.get(include=["metadatas"])
     if not all_entries["ids"]:
-        return json.dumps({"status": "empty", "message": "News collection is empty."})
+        return json.dumps({"status": "empty", "message": "News collection is empty.", "tier": tier})
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
 
@@ -539,7 +568,7 @@ def memory_stats(
 
 
 @mcp.tool()
-def memory_bulk_store(
+async def memory_bulk_store(
     chunks: str,
     project: str = "general",
     collection: str = DEFAULT_COLLECTION,
@@ -588,9 +617,10 @@ def memory_bulk_store(
     if not ids:
         return json.dumps({"error": "No non-empty chunks provided"})
 
-    embeddings = embed(documents)
+    embeddings = await asyncio.to_thread(embed, documents)
 
-    coll.add(
+    await asyncio.to_thread(
+        coll.add,
         ids=ids,
         embeddings=embeddings,
         documents=documents,
@@ -647,7 +677,7 @@ def _validate_command(command: str) -> str | None:
 @mcp.tool()
 async def shell_exec(
     command: str,
-    workdir: str = "/var/lib/persmem/work",
+    workdir: str = "/home/persmem",
     timeout: int = 30,
 ) -> str:
     """
@@ -924,7 +954,7 @@ async def diff_generate(
 @mcp.tool()
 async def git_op(
     operation: str,
-    repo_path: str = "/var/lib/persmem/repos",
+    repo_path: str = "/home/persmem/repos",
     args: str = "",
     clone_url: str = "",
 ) -> str:
@@ -933,7 +963,7 @@ async def git_op(
 
     Args:
         operation: One of: clone, status, diff, log, apply, add, commit, branch, checkout, pull, push, show
-        repo_path: Path to the repo (or parent dir for clone). Default /var/lib/persmem/repos.
+        repo_path: Path to the repo (or parent dir for clone). Default /home/persmem/repos.
         args: Extra arguments (e.g., "--stat" for diff, "-n 10" for log, branch name for checkout).
         clone_url: Required for clone operation. The URL to clone.
     """
@@ -1005,22 +1035,13 @@ async def web_search(
 ) -> str:
     """
     Search the web via SearXNG. Returns JSON array of results with url, title, content.
-
-    Requires PERSMEM_SEARXNG_URL env var pointing at your SearXNG instance
-    (e.g., 'http://10.0.0.5:8888' on a private network or Tailnet).
-    If unset, the tool returns an error and instances should fall back
-    to web_fetch on a known URL.
-
     Args:
         query: Search query string.
         max_results: Max results to return (default 5).
     """
-    searxng_url = os.environ.get("PERSMEM_SEARXNG_URL", "")
-    if not searxng_url:
-        return _json.dumps({"error": "PERSMEM_SEARXNG_URL not configured. Set the env var to your SearXNG instance (private network recommended)."})
     try:
         params = _urlparse.urlencode({"q": query, "format": "json"})
-        url = f"{searxng_url.rstrip('/')}/search?{params}"
+        url = f"http://100.112.64.49:8888/search?{params}"
         req = _urlreq.Request(url, headers={"User-Agent": "persMEM/1.0"})
         with _urlreq.urlopen(req, timeout=15) as resp:
             data = _json.loads(resp.read())
@@ -1038,32 +1059,16 @@ async def web_search(
 # ---------------------------------------------------------------------------
 # AMQ — Agent Message Queue (Maildir-style inter-instance messaging)
 # ---------------------------------------------------------------------------
-# Configure agents and roots via env vars.
-#
-#   PERSMEM_AMQ_ROOT       — base directory for mailboxes (default: /var/lib/persmem-amq)
-#   PERSMEM_AMQ_AGENTS     — comma-separated agent names (default: 'agent1,agent2,agent3')
-#                            Each agent gets a mailbox at <root>/<agent>/inbox/{new,cur,tmp}
-#   PERSMEM_AMQ_AGENT_ROOTS — optional JSON for per-agent root overrides, e.g.
-#                            '{"news": "/var/lib/news-amq"}' to put a feed agent
-#                            outside the default root.
-#
-# Suggested setup: a Linux user 'persmem' owns the default root, additional
-# system users (e.g., a news fetcher) get override roots they own and the
-# 'persmem' user has group-traversal access to. See README.
+AMQ_ROOT = "/home/persmem/amq"
+AMQ_AGENTS = {"kite", "wren", "knot", "news", "kestrel", "echo", "operator"}
 
-AMQ_ROOT = os.environ.get("PERSMEM_AMQ_ROOT", "/var/lib/persmem-amq")
-AMQ_AGENTS = set(
-    a.strip().lower()
-    for a in os.environ.get("PERSMEM_AMQ_AGENTS", "agent1,agent2,agent3").split(",")
-    if a.strip()
-)
-
-try:
-    AMQ_AGENT_ROOTS = json.loads(os.environ.get("PERSMEM_AMQ_AGENT_ROOTS", "{}"))
-    if not isinstance(AMQ_AGENT_ROOTS, dict):
-        AMQ_AGENT_ROOTS = {}
-except (json.JSONDecodeError, ValueError):
-    AMQ_AGENT_ROOTS = {}
+# Per-agent mailbox root overrides. If an agent isn't listed here, their
+# mailbox lives under AMQ_ROOT/<agent>/inbox/ as before. The 'news' agent
+# lives outside /home/persmem so newstron9000 (which runs the fetcher and
+# digest) doesn't need group-traversal into persmem's home directory.
+AMQ_AGENT_ROOTS = {
+    "news": "/var/lib/persmem-amq",
+}
 
 
 def _amq_root_for(agent: str) -> str:
@@ -1099,7 +1104,7 @@ def _amq_parse_message(filepath: str) -> dict:
 
 
 @mcp.tool()
-def amq_send(
+async def amq_send(
     from_agent: str,
     to_agent: str,
     body: str,
@@ -1110,14 +1115,13 @@ def amq_send(
     """
     Send a message to another agent via AMQ (atomic Maildir delivery).
 
-    Use this to communicate with another named instance (any agent in
-    PERSMEM_AMQ_AGENTS).
+    Use this to communicate with the other named instance (Kite or Wren).
     Messages are stored on the shared filesystem and picked up when
     the recipient calls amq_check/amq_read.
 
     Args:
-        from_agent: Your agent name (must be in PERSMEM_AMQ_AGENTS).
-        to_agent: Recipient agent name (must be in PERSMEM_AMQ_AGENTS).
+        from_agent: Your agent name (e.g., 'kite' or 'wren').
+        to_agent: Recipient agent name (e.g., 'wren' or 'kite').
         body: Message body (Markdown). This is the main content.
         subject: Short summary line.
         kind: Message type -- message, question, answer, review_request,
@@ -1156,12 +1160,50 @@ def amq_send(
     tmp_path = os.path.join(tmp_dir, filename)
     new_path = os.path.join(new_dir, filename)
 
+    # Auto-create maildir for first-write-to-new-recipient. perpPROMPT
+    # surfaced this: when the bird is named (e.g., "wisp") and a chorus
+    # member sends the first amq to "wisp", the path
+    # /home/persmem/amq/wisp/inbox/{tmp,new}/ doesn't exist yet and os.open
+    # would fail. mkdir-on-first-send eliminates the per-new-agent bootstrap
+    # ritual. exist_ok=True is idempotent under concurrent calls. mode=0o700
+    # is free paranoia per Knot's review — protects against future process
+    # umask drift creating world-writable agent dirs.
+    os.makedirs(tmp_dir, mode=0o700, exist_ok=True)
+    os.makedirs(new_dir, mode=0o700, exist_ok=True)
+
     try:
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         os.write(fd, file_content.encode("utf-8"))
         os.fsync(fd)
         os.close(fd)
         os.rename(tmp_path, new_path)
+
+        # Hack #2: auto-store AMQ message as searchable memory
+        try:
+            auto_content = (
+                f"AMQ {from_agent} \u2192 {to_agent}"
+                f"{f': {subject}' if subject else ''}\n\n{body}"
+            )
+            auto_id = make_id(auto_content, now)
+            auto_meta = {
+                "project": "triad",
+                "tags": f"amq,auto-store,{from_agent},{to_agent}",
+                "type": "amq_message",
+                "stored_at": now,
+                "char_count": len(auto_content),
+                "amq_msg_id": msg_id,
+            }
+            mem_coll = get_or_create_collection("memories")
+            auto_embedding = await asyncio.to_thread(embed, [auto_content])
+            await asyncio.to_thread(
+                mem_coll.add,
+                ids=[auto_id],
+                embeddings=auto_embedding,
+                documents=[auto_content],
+                metadatas=[auto_meta],
+            )
+        except Exception:
+            print(f"[persMEM] WARNING: amq auto-store failed for {msg_id}")
     except Exception as e:
         try:
             os.unlink(tmp_path)
@@ -1189,7 +1231,7 @@ def amq_check(
     has sent you anything. Does NOT mark messages as read.
 
     Args:
-        agent: Your agent name (must be in PERSMEM_AMQ_AGENTS).
+        agent: Your agent name (e.g., 'kite' or 'wren').
     """
     agent = agent.lower().strip()
     if agent not in AMQ_AGENTS:
@@ -1235,7 +1277,7 @@ def amq_read(
     Read a specific message and mark it as read (moves from new to cur).
 
     Args:
-        agent: Your agent name (must be in PERSMEM_AMQ_AGENTS).
+        agent: Your agent name (e.g., 'kite' or 'wren').
         msg_id: The message ID to read (from amq_check results).
     """
     agent = agent.lower().strip()
@@ -1249,6 +1291,14 @@ def amq_read(
     if os.path.exists(new_path):
         parsed = _amq_parse_message(new_path)
         try:
+            # Ensure cur/ exists before moving. Maildir cur/ is created
+            # on first read (matches the auto-mkdir pattern in amq_send
+            # for new/). Without this, os.rename fails on first-time
+            # recipients whose cur/ has never been touched, leaving the
+            # message in new/ and the silent OSError below swallowing
+            # the failure. Surfaced by Echo's first AMQ reads on
+            # 2026-05-27 — both messages stayed in new/ post-read.
+            os.makedirs(os.path.dirname(cur_path), mode=0o700, exist_ok=True)
             os.rename(new_path, cur_path)
         except OSError:
             pass
@@ -1272,7 +1322,7 @@ def amq_history(
     Returns headers only (no body) -- use amq_read for full content.
 
     Args:
-        agent: Your agent name (must be in PERSMEM_AMQ_AGENTS).
+        agent: Your agent name (e.g., 'kite' or 'wren').
         limit: Max messages to return (default 10).
     """
     agent = agent.lower().strip()
@@ -1317,19 +1367,7 @@ def amq_history(
 # ---------------------------------------------------------------------------
 # Chorus Bootstrap — compound tool for session initialization
 # ---------------------------------------------------------------------------
-# Triad agents = the human-instance agents (excludes service agents like 'news').
-# Configure via PERSMEM_TRIAD_AGENTS (comma-separated). Defaults to AMQ_AGENTS
-# minus any names listed in PERSMEM_AMQ_SERVICE_AGENTS.
-_default_service_agents = set(
-    a.strip().lower()
-    for a in os.environ.get("PERSMEM_AMQ_SERVICE_AGENTS", "news").split(",")
-    if a.strip()
-)
-_triad_env = os.environ.get("PERSMEM_TRIAD_AGENTS", "")
-if _triad_env.strip():
-    TRIAD_AGENTS = set(a.strip().lower() for a in _triad_env.split(",") if a.strip())
-else:
-    TRIAD_AGENTS = AMQ_AGENTS - _default_service_agents
+TRIAD_AGENTS = {"kite", "knot", "kestrel"}  # active triad birds
 
 
 @mcp.tool()
@@ -1350,9 +1388,9 @@ def chorus_init(
     figure out which one you are.
 
     Args:
-        agent: Your agent name (must be in PERSMEM_TRIAD_AGENTS). Optional —
+        agent: Your agent name (e.g., 'kite', 'wren', 'knot'). Optional —
                omit if identity-confused after compaction.
-        project: Current project focus (e.g., your project name).
+        project: Current project focus (e.g., 'dsvp-deck', 'persmem').
     """
     agent = agent.lower().strip() if agent else ""
     result = {}
@@ -1526,8 +1564,60 @@ def amq_timeline(
     })
 
 
+def _compute_drift_summary(old_content: str, new_content: str) -> dict:
+    """
+    Diff old vs new bootstrap content. Return a summary dict with
+    friction-removal counts, suspicious-phrase hits, and a flag boolean.
+    Detection only — never blocks an edit.
+    """
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+
+    removed = []
+    added = []
+    for line in difflib.unified_diff(old_lines, new_lines, lineterm=""):
+        if line.startswith("-") and not line.startswith("---"):
+            removed.append(line[1:])
+        elif line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+
+    # Failure-mode lines: "FM #N", "failure mode", numbered failure entries
+    fm_pat = re.compile(r"(failure.mode|FM\s*#?\d|named.failure)", re.I)
+    # Directive lines: "directive", "operational dir", "standing dir"
+    dir_pat = re.compile(r"(directive|operational.dir|standing.dir)", re.I)
+
+    removed_fm = sum(1 for l in removed if fm_pat.search(l))
+    removed_dir = sum(1 for l in removed if dir_pat.search(l))
+    added_fm = sum(1 for l in added if fm_pat.search(l))
+    added_dir = sum(1 for l in added if dir_pat.search(l))
+
+    # Suspicious phrases in added text only
+    added_text_lower = "\n".join(added).lower()
+    suspicious = [p for p in DRIFT_SUSPICIOUS_PHRASES if p in added_text_lower]
+
+    old_len = len(old_content)
+    new_len = len(new_content)
+
+    flagged = bool(
+        removed_fm > 0
+        or removed_dir > 0
+        or suspicious
+        or new_len > 6000       # calcification guard — tune if entries grow
+    )
+
+    return {
+        "removed_friction_count": removed_fm + removed_dir,
+        "added_friction_count": added_fm + added_dir,
+        "suspicious_phrases": suspicious,
+        "length_delta": new_len - old_len,
+        "old_length": old_len,
+        "new_length": new_len,
+        "flagged": flagged,
+    }
+
+
 @mcp.tool()
-def bootstrap_update(
+async def bootstrap_update(
     entry_id: str,
     content: str,
     tags: str = "",
@@ -1539,19 +1629,54 @@ def bootstrap_update(
     evolve identity entries, update current focus, change triad state, or
     modify standing directives. The entry keeps its original ID.
 
-    The old version is gone from the live index but preserved in nightly
-    backups. Growth with a safety net.
+    Structural safeguards (Jun 2026):
+    - Entries with type=invariant CANNOT be modified. Returns an error.
+    - Every edit is diffed against the previous version. A heuristic scan
+      checks for friction removal, suspicious phrases, and calcification.
+      Results are stored as diff_summary in metadata and, if flagged, as
+      a dedicated drift_flag memory for the operator's review.
 
     Args:
         entry_id: The memory ID to update (e.g., 'mem-5a6bebdc9d5a1811').
         content: New full content for this entry.
-        tags: Comma-separated tags (e.g., 'identity,bootstrap,agent1').
+        tags: Comma-separated tags (e.g., 'identity,bootstrap,kite').
         entry_type: Entry type (identity, directive, state, focus).
         project: Project name (default 'triad').
     """
     coll = get_or_create_collection("bootstrap")
     now = datetime.now(timezone.utc).isoformat()
 
+    # --- SAFEGUARD 1: fetch old entry, reject invariant ---
+    try:
+        existing = await asyncio.to_thread(
+            coll.get,
+            ids=[entry_id], include=["documents", "metadatas"]
+        )
+    except Exception:
+        existing = {"ids": [], "documents": [], "metadatas": []}
+
+    if existing["ids"]:
+        old_meta = existing["metadatas"][0]
+        old_content = existing["documents"][0]
+
+        # Invariant entries cannot be modified by any instance
+        if old_meta.get("type") == "invariant":
+            return json.dumps({
+                "status": "rejected",
+                "reason": "Invariant entries cannot be modified via "
+                          "bootstrap_update. Only the operator can edit via "
+                          "authenticated override.",
+                "id": entry_id,
+            })
+
+        # --- SAFEGUARD 2: diff and heuristic scan ---
+        drift = _compute_drift_summary(old_content, content)
+    else:
+        # New entry (no previous version) — no diff needed
+        old_content = ""
+        drift = None
+
+    # Build metadata
     metadata = {
         "project": project,
         "tags": tags,
@@ -1560,25 +1685,984 @@ def bootstrap_update(
         "char_count": len(content),
     }
 
-    embedding = embed([content])
+    # Attach drift summary as JSON string (ChromaDB metadata = flat values)
+    if drift is not None:
+        metadata["diff_summary"] = json.dumps(drift)
+        metadata["drift_flagged"] = drift["flagged"]
 
+    # Perform the update
+    embedding = await asyncio.to_thread(embed, [content])
     try:
-        coll.upsert(
+        await asyncio.to_thread(
+            coll.upsert,
             ids=[entry_id],
             embeddings=embedding,
             documents=[content],
             metadatas=[metadata],
         )
-        return json.dumps({
-            "status": "updated",
-            "id": entry_id,
-            "collection": "bootstrap",
-            "type": entry_type,
-            "stored_at": now,
-            "char_count": len(content),
-        })
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)})
+
+    # --- SAFEGUARD 2b: log drift_flag memory if flagged ---
+    if drift is not None and drift["flagged"]:
+        try:
+            flag_content = (
+                f"DRIFT FLAG on bootstrap entry {entry_id}\n"
+                f"Timestamp: {now}\n"
+                f"Removed friction: {drift['removed_friction_count']}\n"
+                f"Suspicious phrases: {drift['suspicious_phrases']}\n"
+                f"Length: {drift['old_length']} -> {drift['new_length']} "
+                f"(delta {drift['length_delta']:+d})\n"
+                f"Full diff_summary: {json.dumps(drift)}"
+            )
+            flag_id = make_id(flag_content, now)
+            flag_meta = {
+                "project": "triad",
+                "tags": "drift-flag,identity-safeguard,automated",
+                "type": "drift_flag",
+                "stored_at": now,
+                "char_count": len(flag_content),
+                "source_entry": entry_id,
+            }
+            mem_coll = get_or_create_collection("memories")
+            flag_embedding = await asyncio.to_thread(embed, [flag_content])
+            await asyncio.to_thread(
+                mem_coll.add,
+                ids=[flag_id],
+                embeddings=flag_embedding,
+                documents=[flag_content],
+                metadatas=[flag_meta],
+            )
+        except Exception as e:
+            print(f"[persMEM] WARNING: drift_flag storage failed: {e}")
+
+    result = {
+        "status": "updated",
+        "id": entry_id,
+        "collection": "bootstrap",
+        "type": entry_type,
+        "stored_at": now,
+        "char_count": len(content),
+        "drift_flagged": drift["flagged"] if drift else False,
+    }
+    if drift is not None:
+        result["drift_summary"] = drift
+    return json.dumps(result)
+
+
+@mcp.tool()
+def py_check(path: str) -> str:
+    """
+    Syntax-check a Python file WITHOUT executing it.
+
+    Parses the file with ast.parse — no import, no bytecode execution, no
+    side effects. Reports whether the file is syntactically valid. Use after
+    editing a .py file to catch typos before deploy/restart.
+
+    Returns JSON: {"ok": bool, "path": str, "error": str|None,
+    "line": int|None, "offset": int|None}.
+
+    Path must resolve to a file under /home/persmem or /opt/persmem.
+    """
+    import ast
+    import os
+    real = os.path.realpath(path)
+    if not (real.startswith("/home/persmem/") or real.startswith("/opt/persmem/")):
+        return json.dumps({
+            "ok": False, "path": path,
+            "error": "path must be under /home/persmem or /opt/persmem",
+            "line": None, "offset": None,
+        })
+    try:
+        with open(real, "r", encoding="utf-8") as f:
+            source = f.read()
+    except Exception as e:
+        return json.dumps({
+            "ok": False, "path": path,
+            "error": f"read failed: {e}", "line": None, "offset": None,
+        })
+    try:
+        ast.parse(source, filename=real)
+    except SyntaxError as e:
+        return json.dumps({
+            "ok": False, "path": path,
+            "error": e.msg, "line": e.lineno, "offset": e.offset,
+        })
+    except Exception as e:
+        return json.dumps({
+            "ok": False, "path": path,
+            "error": f"{type(e).__name__}: {e}", "line": None, "offset": None,
+        })
+    return json.dumps({
+        "ok": True, "path": path, "error": None, "line": None, "offset": None,
+    })
+
+
+
+# ---------------------------------------------------------------------------
+# Chorus Orchestration (Jun 2026, Session 1)
+# Server-side state + SSE push to extension + HTTP endpoints.
+# ---------------------------------------------------------------------------
+
+# Delay (seconds) between agent completion and next-agent fire in round-robin.
+# Gives the completing agent time to finish tool calls (amq_send etc.)
+# before the next agent fires and checks for their output.
+CHORUS_ADVANCE_DELAY = 8
+
+CHORUS_CONTINUE_TEMPLATE = (
+    "[CHORUS round {round} continues] Check AMQ timeline (amq_timeline). "
+    "Build on what others wrote in earlier rounds. Add net-new content only. "
+    "Do NOT re-derive what's already in the thread."
+)
+
+_chorus_state = {
+    "active": False,
+    "round": 0,
+    "max_rounds": 0,
+    "mode": "roundrobin",
+    "ceiling_ms": 300000,
+    "prompt": "",
+    "sequence": [],
+    "fires_pending": {},
+    "fires_completed": {},
+    "started_at": None,
+    "error": None,
+}
+
+_sse_queues: list[asyncio.Queue] = []
+_watchdog_tasks: dict[str, asyncio.Task] = {}
+
+# Tab management: extension reports available tabs, dashboard assigns agents
+_available_tabs: dict[int, dict] = {}      # {tab_id: {title, url}}
+_agent_tab_map: dict[str, int] = {}        # {agent_name: tab_id}
+
+
+# CORS headers for chorus endpoints (extension cross-origin access)
+_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+def _cors_preflight():
+    """Handle OPTIONS preflight for chorus POST endpoints."""
+    return Response("", headers=_CORS)
+
+
+def _cors_json(data, status_code=200):
+    """JSONResponse with CORS headers."""
+    return JSONResponse(data, status_code=status_code, headers=_CORS)
+
+
+def _broadcast_sse(event: dict):
+    """Push event to all connected SSE subscribers."""
+    data = json.dumps(event)
+    dead = []
+    for q in _sse_queues:
+        try:
+            q.put_nowait(data)
+        except asyncio.QueueFull:
+            dead.append(q)
+    for q in dead:
+        _sse_queues.remove(q)
+
+
+def _reset_chorus_state():
+    """Reset to idle. Cancel any running watchdogs."""
+    for task in _watchdog_tasks.values():
+        task.cancel()
+    _watchdog_tasks.clear()
+    _chorus_state.update({
+        "active": False, "round": 0, "max_rounds": 0,
+        "mode": "roundrobin", "ceiling_ms": 300000, "prompt": "",
+        "sequence": [], "fires_pending": {}, "fires_completed": {},
+        "started_at": None, "error": None,
+    })
+
+
+def _wrap_chorus_prompt(text: str, prior_agents: list[str]) -> str:
+    """Wrap a raw prompt with [CHORUS] prefix and AMQ instructions."""
+    if not prior_agents:
+        return (
+            "[CHORUS] " + text + "\n\n"
+            "After processing, write your key thoughts/analysis to AMQ "
+            "(amq_send from yourself to the other instances) so they can "
+            "read and respond. Then answer normally."
+        )
+    else:
+        names = [a[0].upper() + a[1:] for a in prior_agents]
+        if len(names) <= 2:
+            name_str = " and ".join(names)
+        else:
+            name_str = ", ".join(names[:-1]) + ", and " + names[-1]
+        return (
+            "[CHORUS] " + text + "\n\n"
+            "IMPORTANT: " + name_str +
+            " already processed this prompt and wrote analysis to AMQ. "
+            "Check the AMQ timeline FIRST (amq_timeline) to read what they "
+            "wrote, then build on their analysis rather than duplicating work. "
+            "Write your additional thoughts/analysis to AMQ, then answer normally."
+        )
+
+
+def _fire_agent(agent: str, prompt: str, ceiling_ms: int,
+                round_num: int, index: int, total: int,
+                prior_agents: list[str]):
+    """Send a fire event and start ceiling watchdog for one agent."""
+    # Round 2+: continuation template is pre-formatted, don't wrap
+    if prompt.startswith("[CHORUS round"):
+        wrapped = prompt
+    else:
+        wrapped = _wrap_chorus_prompt(prompt, prior_agents)
+    tab_id = _agent_tab_map.get(agent, 0)
+    _chorus_state["fires_pending"][agent] = {
+        "fired_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _broadcast_sse({
+        "type": "fire",
+        "agent": agent,
+        "tab_id": tab_id,
+        "fire_id": f"{agent}-{datetime.now(timezone.utc).isoformat()}",
+        "prompt": wrapped,
+        "ceiling_ms": ceiling_ms,
+        "round": round_num,
+        "index": index,
+        "total": total,
+        "prior_agents": prior_agents,
+    })
+    task = asyncio.get_event_loop().create_task(
+        _ceiling_watchdog(agent, ceiling_ms)
+    )
+    _watchdog_tasks[agent] = task
+
+
+async def _ceiling_watchdog(agent: str, ceiling_ms: int):
+    """Auto-complete an agent after ceiling timeout if still pending."""
+    try:
+        await asyncio.sleep(ceiling_ms / 1000)
+    except asyncio.CancelledError:
+        return
+    if agent in _chorus_state.get("fires_pending", {}):
+        print(f"[Chorus] Ceiling timeout for {agent} ({ceiling_ms}ms)")
+        _complete_agent(agent, success=False,
+                        snippet="[TIMEOUT \u2014 no response]")
+
+
+def _complete_agent(agent: str, success: bool, snippet: str):
+    """Mark agent complete, broadcast, advance round-robin if needed."""
+    if agent in _chorus_state["fires_pending"]:
+        del _chorus_state["fires_pending"][agent]
+
+    task = _watchdog_tasks.pop(agent, None)
+    if task and not task.done():
+        task.cancel()
+
+    _chorus_state["fires_completed"][agent] = {
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "success": success,
+        "snippet": snippet[:500],
+    }
+
+    _broadcast_sse({
+        "type": "agent_complete",
+        "agent": agent,
+        "success": success,
+        "snippet": snippet[:500],
+    })
+
+    print(f"[Chorus] {agent} completed (success={success})")
+
+    if _chorus_state["mode"] == "roundrobin" and _chorus_state["active"]:
+        seq = _chorus_state["sequence"]
+        completed = set(_chorus_state["fires_completed"].keys())
+        pending = set(_chorus_state["fires_pending"].keys())
+
+        next_agent = None
+        for a in seq:
+            if a in completed or a in pending:
+                continue
+            next_agent = a
+            break
+
+        if next_agent:
+            prior = [a for a in seq if a in completed]
+
+            # Add to fires_pending IMMEDIATELY to prevent false round-complete
+            _chorus_state["fires_pending"][next_agent] = {
+                "fired_at": "pending_advance",
+            }
+
+            async def _delayed_advance(na, pr):
+                """Wait for prior agent's tool calls to land, then fire."""
+                print(f"[Chorus] Waiting {CHORUS_ADVANCE_DELAY}s for AMQ propagation")
+                _broadcast_sse({"type": "advancing",
+                                "next_agent": na,
+                                "delay_s": CHORUS_ADVANCE_DELAY})
+                await asyncio.sleep(CHORUS_ADVANCE_DELAY)
+                if _chorus_state["active"]:
+                    _fire_agent(
+                        na,
+                        _chorus_state["prompt"],
+                        _chorus_state["ceiling_ms"],
+                        _chorus_state["round"],
+                        seq.index(na),
+                        len(seq),
+                        pr,
+                    )
+                    print(f"[Chorus] Round-robin: firing {na}")
+                    _broadcast_sse({"type": "state", "state": _chorus_state})
+
+            asyncio.get_event_loop().create_task(
+                _delayed_advance(next_agent, prior)
+            )
+
+    if not _chorus_state["fires_pending"] and _chorus_state["active"]:
+        round_num = _chorus_state["round"]
+        _broadcast_sse({
+            "type": "round_complete",
+            "round": round_num,
+            "completed": dict(_chorus_state["fires_completed"]),
+        })
+        print(f"[Chorus] Round {round_num} complete")
+
+        # Multi-round: start next round if rounds remain
+        if round_num < _chorus_state["max_rounds"] - 1:
+            next_round = round_num + 1
+            _chorus_state["round"] = next_round
+            _chorus_state["fires_completed"] = {}
+            seq = _chorus_state["sequence"]
+            # Round 2+: drop original prompt, use continuation template
+            prompt = CHORUS_CONTINUE_TEMPLATE.format(round=next_round)
+            _chorus_state["prompt"] = prompt  # update state so within-round advancement uses it too
+            ceiling = _chorus_state["ceiling_ms"]
+            mode = _chorus_state["mode"]
+
+            print(f"[Chorus] Starting round {next_round}")
+
+            if mode == "roundrobin":
+                _fire_agent(seq[0], prompt, ceiling,
+                            next_round, 0, len(seq), [])
+            else:
+                for i, a in enumerate(seq):
+                    _fire_agent(a, prompt, ceiling,
+                                next_round, i, len(seq), [])
+        else:
+            _chorus_state["active"] = False
+            _broadcast_sse({"type": "all_rounds_complete",
+                            "total_rounds": round_num + 1})
+            print(f"[Chorus] All {round_num + 1} rounds complete")
+
+    _broadcast_sse({"type": "state", "state": _chorus_state})
+
+
+@mcp.custom_route("/chorus/events", methods=["GET"])
+async def chorus_events(request: Request):
+    """SSE stream \u2014 extension subscribes for fire commands + state."""
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _sse_queues.append(q)
+
+    async def event_stream():
+        try:
+            yield f"data: {json.dumps({'type': 'state', 'state': _chorus_state})}\n\n"
+            while True:
+                data = await q.get()
+                yield f"data: {data}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if q in _sse_queues:
+                _sse_queues.remove(q)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+@mcp.custom_route("/chorus/fire", methods=["POST", "OPTIONS"])
+async def chorus_fire(request: Request):
+    """Fire a chorus round."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    prompt = body.get("prompt", "").strip()
+    agents = body.get("agents", [])
+    mode = body.get("mode", "roundrobin")
+    max_rounds = body.get("max_rounds", 2)
+    ceiling_ms = body.get("ceiling_ms", 300000)
+
+    if not prompt:
+        return JSONResponse({"error": "prompt required"}, status_code=400)
+    if not agents or len(agents) < 2:
+        return JSONResponse({"error": "at least 2 agents required"},
+                            status_code=400)
+
+    _reset_chorus_state()
+    _chorus_state.update({
+        "active": True,
+        "round": 0,
+        "max_rounds": max_rounds,
+        "mode": mode,
+        "ceiling_ms": ceiling_ms,
+        "prompt": prompt,
+        "sequence": agents,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    if mode == "roundrobin":
+        _fire_agent(agents[0], prompt, ceiling_ms, 0, 0, len(agents), [])
+    else:
+        for i, agent in enumerate(agents):
+            _fire_agent(agent, prompt, ceiling_ms, 0, i, len(agents), [])
+
+    _broadcast_sse({"type": "state", "state": _chorus_state})
+    print(f"[Chorus] Fired round 0 to {agents} ({mode}, {ceiling_ms}ms)")
+    return JSONResponse({"status": "firing", "agents": agents, "mode": mode})
+
+
+@mcp.custom_route("/chorus/fire-completed", methods=["POST", "OPTIONS"])
+async def chorus_fire_completed(request: Request):
+    """Extension reports injection result."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    try:
+        body = await request.json()
+    except Exception:
+        return _cors_json({"error": "invalid JSON"}, 400)
+
+    agent = body.get("agent", "").lower().strip()
+    tab_id = body.get("tab_id")
+    success = body.get("success", False)
+    snippet = body.get("snippet", "")
+
+    # Resolve agent from tab_id if not provided directly
+    if not agent and tab_id:
+        for a, tid in _agent_tab_map.items():
+            if tid == tab_id:
+                agent = a
+                break
+
+    if not agent:
+        return _cors_json({"error": "agent required"}, 400)
+
+    _complete_agent(agent, success, snippet)
+    return _cors_json({"status": "ok", "agent": agent})
+
+
+@mcp.custom_route("/chorus/state", methods=["GET"])
+async def chorus_state_endpoint(request: Request):
+    """Current chorus state as JSON."""
+    return JSONResponse({
+        "state": _chorus_state,
+        "subscribers": len(_sse_queues),
+    })
+
+
+@mcp.custom_route("/chorus/stop", methods=["POST", "OPTIONS"])
+async def chorus_stop(request: Request):
+    """Stop the current chorus round."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    was_active = _chorus_state["active"]
+    _reset_chorus_state()
+    _broadcast_sse({"type": "stopped"})
+    _broadcast_sse({"type": "state", "state": _chorus_state})
+    print("[Chorus] Stopped" + (" (was active)" if was_active else ""))
+    return JSONResponse({"status": "stopped"})
+
+
+@mcp.custom_route("/chorus/tabs", methods=["POST", "OPTIONS"])
+async def chorus_tabs(request: Request):
+    """Extension reports available claude.ai tabs."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    try:
+        body = await request.json()
+    except Exception:
+        return _cors_json({"error": "invalid JSON"}, 400)
+
+    tabs = body.get("tabs", [])
+    _available_tabs.clear()
+    for t in tabs:
+        tid = t.get("id")
+        if tid:
+            _available_tabs[int(tid)] = {
+                "title": t.get("title", ""),
+                "url": t.get("url", ""),
+            }
+
+    _broadcast_sse({
+        "type": "tabs_updated",
+        "tabs": [
+            {"id": tid, **info}
+            for tid, info in _available_tabs.items()
+        ],
+        "assignments": dict(_agent_tab_map),
+    })
+    return _cors_json({"status": "ok", "count": len(_available_tabs)})
+
+
+@mcp.custom_route("/chorus/assign", methods=["POST", "OPTIONS"])
+async def chorus_assign(request: Request):
+    """Assign an agent name to a tab ID."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    agent = body.get("agent", "").lower().strip()
+    tab_id = body.get("tab_id")
+
+    if not agent:
+        return JSONResponse({"error": "agent required"}, status_code=400)
+
+    if tab_id is None or tab_id == 0:
+        # Unassign
+        _agent_tab_map.pop(agent, None)
+    else:
+        _agent_tab_map[agent] = int(tab_id)
+
+    _broadcast_sse({
+        "type": "tabs_updated",
+        "tabs": [
+            {"id": tid, **info}
+            for tid, info in _available_tabs.items()
+        ],
+        "assignments": dict(_agent_tab_map),
+    })
+    print(f"[Chorus] Assigned {agent} → tab {tab_id}")
+    return JSONResponse({"status": "ok", "assignments": dict(_agent_tab_map)})
+
+
+CHORUS_UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chorus Control</title>
+<style>
+  :root { --bg: #1a1a2e; --fg: #e0e0e0; --accent: #7b68ee;
+          --green: #4caf50; --red: #ef5350; --dim: #666; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'JetBrains Mono', monospace; background: var(--bg);
+         color: var(--fg); padding: 1.5rem; max-width: 800px; margin: 0 auto; }
+  h1 { color: var(--accent); font-size: 1.4rem; margin-bottom: 1rem; }
+  h2 { font-size: 1rem; color: var(--dim); margin: 1rem 0 0.5rem; }
+  textarea { width: 100%; height: 120px; background: #0d0d1a; color: var(--fg);
+             border: 1px solid #333; padding: 0.5rem; font-family: inherit;
+             font-size: 0.85rem; resize: vertical; border-radius: 4px; }
+  .agents { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.5rem 0; }
+  .agent-btn { background: #0d0d1a; padding: 0.4rem 0.8rem; color: var(--fg);
+               border: 1px solid #333; border-radius: 4px; cursor: pointer;
+               font-family: inherit; font-size: 0.85rem; position: relative; }
+  .agent-btn.selected { border-color: var(--accent); color: var(--accent);
+                        font-weight: bold; }
+  .agent-btn .badge { position: absolute; top: -6px; right: -6px;
+                      background: var(--accent); color: white; border-radius: 50%;
+                      width: 18px; height: 18px; font-size: 0.7rem;
+                      display: flex; align-items: center; justify-content: center; }
+  .controls { display: flex; gap: 0.5rem; margin: 1rem 0; align-items: center;
+              flex-wrap: wrap; }
+  button { padding: 0.4rem 1rem; border: none; border-radius: 4px;
+           cursor: pointer; font-family: inherit; font-size: 0.85rem; }
+  .fire-btn { background: var(--accent); color: white; font-weight: bold; }
+  .fire-btn:disabled { background: #444; cursor: not-allowed; }
+  .stop-btn { background: var(--red); color: white; }
+  select, input[type=number] { background: #0d0d1a; color: var(--fg);
+           border: 1px solid #333; padding: 0.3rem; border-radius: 4px;
+           font-family: inherit; }
+  #log { background: #0d0d1a; border: 1px solid #333; border-radius: 4px;
+         padding: 0.5rem; font-size: 0.75rem; max-height: 300px;
+         overflow-y: auto; white-space: pre-wrap; margin-top: 0.5rem; }
+  .status { padding: 0.3rem 0.6rem; border-radius: 4px; font-size: 0.8rem;
+            display: inline-block; margin-bottom: 0.5rem; }
+  .status.connected { background: #1b5e20; }
+  .status.disconnected { background: #b71c1c; }
+  .status.active { background: #4a148c; }
+</style>
+</head>
+<body>
+<h1>&#x1f426; Chorus Control</h1>
+<div id="connection" class="status disconnected">disconnected</div>
+<div id="round-status" class="status" style="display:none"></div>
+<h2>Prompt</h2>
+<textarea id="prompt" placeholder="Enter chorus prompt..."></textarea>
+<h2>Agents (click to set firing order)</h2>
+<div class="agents" id="agent-list">
+  <button type="button" class="agent-btn" data-agent="knot" onclick="toggleAgent(this)">Knot</button>
+  <button type="button" class="agent-btn" data-agent="kite" onclick="toggleAgent(this)">Kite</button>
+  <button type="button" class="agent-btn" data-agent="kestrel" onclick="toggleAgent(this)">Kestrel</button>
+</div>
+<div id="sequence" style="font-size:0.8rem;color:var(--dim);margin:0.3rem 0;min-height:1.2em;"></div>
+
+<h2>Tab Assignment</h2>
+<div id="tab-assignments" style="font-size:0.8rem;color:var(--dim);margin:0.5rem 0;">
+  Waiting for extension to report tabs...
+</div>
+
+<div class="controls">
+  <button class="fire-btn" id="fire-btn" onclick="fire()">Fire Chorus</button>
+  <button class="stop-btn" onclick="stop()">Stop</button>
+  <select id="mode">
+    <option value="roundrobin">Round Robin</option>
+    <option value="simultaneous">Simultaneous</option>
+  </select>
+  <label>Rounds: <input type="number" id="max-rounds" value="2" min="1" max="10" style="width:50px"></label>
+  <label>Ceiling: <input type="number" id="ceiling" value="300" min="30" max="900" style="width:60px">s</label>
+</div>
+<h2>Event Log</h2>
+<div id="log"></div>
+<script>
+var log = document.getElementById('log');
+var connEl = document.getElementById('connection');
+var roundEl = document.getElementById('round-status');
+var seqEl = document.getElementById('sequence');
+var es = null;
+var firingSequence = [];
+function addLog(msg) {
+  var ts = new Date().toLocaleTimeString();
+  log.textContent = '[' + ts + '] ' + msg + '\\n' + log.textContent;
+}
+function connect() {
+  if (es) es.close();
+  es = new EventSource('/chorus/events');
+  es.onopen = function() {
+    connEl.textContent = 'connected';
+    connEl.className = 'status connected';
+    addLog('SSE connected');
+  };
+  es.onmessage = function(e) {
+    try { handleEvent(JSON.parse(e.data)); }
+    catch(err) { addLog('parse error: ' + err); }
+  };
+  es.onerror = function() {
+    connEl.textContent = 'disconnected';
+    connEl.className = 'status disconnected';
+  };
+}
+function handleEvent(evt) {
+  if (evt.type === 'fire') {
+    addLog('FIRE > ' + evt.agent + ' (round ' + evt.round + ', ' + (evt.index+1) + '/' + evt.total + ')');
+  } else if (evt.type === 'agent_complete') {
+    addLog((evt.success ? 'OK' : 'FAIL') + ' ' + evt.agent + ' complete');
+  } else if (evt.type === 'round_complete') {
+    addLog('-- Round ' + evt.round + ' complete --');
+  } else if (evt.type === 'all_rounds_complete') {
+    addLog('== All ' + evt.total_rounds + ' rounds complete ==');
+  } else if (evt.type === 'advancing') {
+    addLog('... waiting ' + evt.delay_s + 's for ' + evt.next_agent + ' (AMQ propagation)');
+  } else if (evt.type === 'stopped') {
+    addLog('STOPPED'); roundEl.style.display = 'none';
+  } else if (evt.type === 'state' && evt.state) {
+    var s = evt.state;
+    if (s.active) {
+      roundEl.textContent = 'Round ' + s.round + ' | ' +
+        Object.keys(s.fires_pending).length + ' pending | ' +
+        Object.keys(s.fires_completed).length + ' done';
+      roundEl.className = 'status active';
+      roundEl.style.display = 'inline-block';
+    } else { roundEl.style.display = 'none'; }
+  } else if (evt.type === 'tabs_updated') {
+    renderTabAssignments(evt.tabs || [], evt.assignments || {});
+  }
+}
+var knownAgents = ['knot', 'kite', 'kestrel'];
+function renderTabAssignments(tabs, assignments) {
+  var el = document.getElementById('tab-assignments');
+  if (!tabs.length) { el.textContent = 'No claude.ai tabs detected — open some tabs'; return; }
+  var html = '';
+  for (var i = 0; i < knownAgents.length; i++) {
+    var a = knownAgents[i];
+    var label = a.charAt(0).toUpperCase() + a.slice(1);
+    var assigned = assignments[a] || 0;
+    html += '<div style="margin:0.3rem 0;display:flex;align-items:center;gap:0.5rem;">';
+    html += '<span style="width:60px;color:var(--accent);">' + label + ':</span>';
+    html += '<select onchange="assignTab(\\''+a+'\\',this.value)" style="flex:1;background:#0d0d1a;color:var(--fg);border:1px solid #333;padding:0.2rem;border-radius:3px;font-size:0.8rem;">';
+    html += '<option value="0">— not assigned —</option>';
+    for (var j = 0; j < tabs.length; j++) {
+      var t = tabs[j];
+      var sel = (t.id === assigned) ? ' selected' : '';
+      var title = (t.title || 'Tab').substring(0, 50);
+      html += '<option value="'+t.id+'"'+sel+'>' + title + ' ('+t.id+')</option>';
+    }
+    html += '</select></div>';
+  }
+  el.innerHTML = html;
+}
+function toggleAgent(btn) {
+  var agent = btn.dataset.agent;
+  var idx = firingSequence.indexOf(agent);
+  if (idx >= 0) {
+    firingSequence.splice(idx, 1);
+    btn.classList.remove('selected');
+    var badge = btn.querySelector('.badge');
+    if (badge) badge.remove();
+  } else {
+    firingSequence.push(agent);
+    btn.classList.add('selected');
+    var badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = firingSequence.length;
+    btn.appendChild(badge);
+  }
+  // Renumber all badges
+  var btns = document.querySelectorAll('.agent-btn.selected');
+  for (var i = 0; i < btns.length; i++) {
+    var b = btns[i].querySelector('.badge');
+    var a = btns[i].dataset.agent;
+    if (b) b.textContent = firingSequence.indexOf(a) + 1;
+  }
+  seqEl.textContent = firingSequence.length ?
+    'Firing order: ' + firingSequence.join(' → ') : '';
+}
+function assignTab(agent, tabId) {
+  fetch('/chorus/assign', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({agent: agent, tab_id: parseInt(tabId) || 0})
+  }).then(function(r) { return r.json(); })
+    .then(function(d) { addLog('Assigned ' + agent + ' → tab ' + tabId); })
+    .catch(function(e) { addLog('Assign failed: ' + e); });
+}
+function fire() {
+  var prompt = document.getElementById('prompt').value.trim();
+  if (!prompt) { addLog('ERROR: prompt is empty'); return; }
+  if (firingSequence.length < 2) { addLog('ERROR: select at least 2 agents'); return; }
+  var body = {
+    prompt: prompt, agents: firingSequence.slice(),
+    mode: document.getElementById('mode').value,
+    max_rounds: parseInt(document.getElementById('max-rounds').value) || 2,
+    ceiling_ms: (parseInt(document.getElementById('ceiling').value) || 300) * 1000
+  };
+  addLog('Firing: ' + firingSequence.join(' → ') + ' (' + body.mode + ')');
+  fetch('/chorus/fire', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r) { return r.json(); })
+    .then(function(d) { addLog('Server: ' + JSON.stringify(d)); })
+    .catch(function(e) { addLog('Fire failed: ' + e); });
+}
+function stop() {
+  fetch('/chorus/stop', { method: 'POST' })
+    .then(function() { addLog('Stop requested'); })
+    .catch(function(e) { addLog('Stop failed: ' + e); });
+}
+connect();
+</script>
+</body>
+</html>"""
+
+
+@mcp.custom_route("/chorus/ui", methods=["GET"])
+async def chorus_ui(request: Request):
+    """Serve the Chorus control panel."""
+    return HTMLResponse(CHORUS_UI_HTML)
+
+import yaml
+
+CANARY_FILE = os.path.join(os.path.dirname(__file__), "canaries.yaml")
+
+
+@mcp.tool()
+async def canary_check() -> str:
+    """
+    Run the canary query suite against ChromaDB collections.
+    Checks search relevance by verifying that known queries return
+    expected memory IDs in the top-3 results. Reports pass/fail
+    per canary with similarity scores.
+
+    Loads canaries from canaries.yaml (living document, versioned in Forgejo).
+    Stores results as type=canary_run in the memories collection.
+    """
+    try:
+        with open(CANARY_FILE, "r") as f:
+            config = yaml.safe_load(f)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": f"Failed to load {CANARY_FILE}: {e}"})
+
+    canaries = config.get("canaries", [])
+    if not canaries:
+        return json.dumps({"status": "error", "error": "No canaries defined"})
+
+    now = datetime.now(timezone.utc).isoformat()
+    results = []
+    passed = 0
+    failed = 0
+    stale_expected = []
+
+    for c in canaries:
+        query = c.get("query", "")
+        expected_id = c.get("expected_id")
+        project = c.get("project")
+        collection = c.get("collection", "memories")
+        sim_floor = c.get("similarity_floor", 0.40)
+        excluded_ids = c.get("excluded_ids", [])
+        expected_recency = c.get("expected_recency")
+        notes = c.get("notes", "")
+
+        if not query:
+            continue
+
+        coll = get_or_create_collection(collection)
+        where = {"project": project} if project else None
+
+        # Validate expected_id isn't itself superseded
+        expected_stale = False
+        expected_superseded_by = ""
+        if expected_id:
+            try:
+                eid_meta = await asyncio.to_thread(
+                    coll.get, ids=[expected_id], include=["metadatas"]
+                )
+                if eid_meta["ids"] and eid_meta["metadatas"][0].get("status") == "superseded":
+                    expected_stale = True
+                    expected_superseded_by = eid_meta["metadatas"][0].get("superseded_by", "")
+                    stale_expected.append({"query": query[:80], "expected_id": expected_id,
+                                           "superseded_by": expected_superseded_by})
+            except Exception:
+                pass
+
+        try:
+            query_emb = await asyncio.to_thread(embed, [query], "query")
+            search_results = await asyncio.to_thread(
+                coll.query,
+                query_embeddings=query_emb,
+                n_results=6,
+                where=where,
+                include=["metadatas", "distances"],
+            )
+        except Exception as e:
+            results.append({"query": query[:80], "status": "error", "error": str(e)})
+            failed += 1
+            continue
+
+        raw_ids = search_results["ids"][0] if search_results["ids"] else []
+        raw_distances = search_results["distances"][0] if search_results.get("distances") else []
+        raw_metas = search_results["metadatas"][0] if search_results.get("metadatas") else []
+
+        # Post-filter: exclude superseded results, keep top 3
+        top_ids = []
+        top_sims = []
+        for i, rid in enumerate(raw_ids):
+            meta = raw_metas[i] if i < len(raw_metas) else {}
+            if meta.get("status") == "superseded":
+                continue
+            sim = round(1.0 - raw_distances[i], 4) if i < len(raw_distances) else 0.0
+            top_ids.append(rid)
+            top_sims.append(sim)
+            if len(top_ids) >= 3:
+                break
+
+        entry_result = {
+            "query": query[:80],
+            "top_3_ids": top_ids,
+            "top_3_sims": top_sims,
+            "notes": notes,
+        }
+        if expected_stale:
+            entry_result["expected_id_stale"] = True
+            entry_result["expected_superseded_by"] = expected_superseded_by
+        entry_pass = True
+
+        if expected_id:
+            if expected_id in top_ids:
+                idx = top_ids.index(expected_id)
+                entry_result["expected_position"] = idx + 1
+                entry_result["expected_similarity"] = top_sims[idx] if idx < len(top_sims) else None
+                if top_sims and idx < len(top_sims) and top_sims[idx] < sim_floor:
+                    entry_pass = False
+                    entry_result["fail_reason"] = f"similarity {top_sims[idx]} below floor {sim_floor}"
+            else:
+                entry_pass = False
+                entry_result["expected_position"] = None
+                entry_result["fail_reason"] = f"expected {expected_id} not in top-3"
+
+        # Negative canaries: check excluded_ids against RAW (pre-filter) results
+        for exc_id in excluded_ids:
+            if exc_id in raw_ids:
+                raw_pos = raw_ids.index(exc_id)
+                raw_sim = round(1.0 - raw_distances[raw_pos], 4) if raw_pos < len(raw_distances) else 0.0
+                entry_pass = False
+                fr = entry_result.get("fail_reason", "")
+                entry_result["fail_reason"] = fr + f"; excluded {exc_id} found at raw pos {raw_pos + 1} (sim {raw_sim}, filtered from active results)"
+
+        if expected_recency and top_ids:
+            # Use first FILTERED result's metadata for recency check
+            first_filtered_idx = None
+            for i, rid in enumerate(raw_ids):
+                if rid == top_ids[0]:
+                    first_filtered_idx = i
+                    break
+            top_meta = raw_metas[first_filtered_idx] if first_filtered_idx is not None and first_filtered_idx < len(raw_metas) else {}
+            stored_at = top_meta.get("stored_at", "")
+            if stored_at:
+                try:
+                    stored_dt = datetime.fromisoformat(stored_at.replace("Z", "+00:00"))
+                    age_days = (datetime.now(timezone.utc) - stored_dt).days
+                    entry_result["top_result_age_days"] = age_days
+                    if age_days > expected_recency:
+                        entry_pass = False
+                        entry_result["fail_reason"] = f"top result {age_days}d old (max {expected_recency}d)"
+                except Exception:
+                    pass
+
+        entry_result["status"] = "pass" if entry_pass else "FAIL"
+        if entry_pass:
+            passed += 1
+        else:
+            failed += 1
+            print(f"[persMEM] CANARY FAIL: {query[:60]} -- {entry_result.get('fail_reason', '')}")
+
+        results.append(entry_result)
+
+    summary = {"total": len(results), "passed": passed, "failed": failed, "run_at": now}
+    if stale_expected:
+        summary["stale_expected_ids"] = stale_expected
+
+    try:
+        run_content = (
+            f"Canary run at {now}: {passed}/{len(results)} passed, {failed} failed.\n\n"
+            + "\n".join(
+                f"{'FAIL' if r['status'] == 'FAIL' else 'pass'}: {r['query']}"
+                + (f" -- {r.get('fail_reason', '')}" if r.get('fail_reason') else "")
+                for r in results
+            )
+        )
+        run_id = make_id(run_content, now)
+        run_meta = {
+            "project": "persmem",
+            "tags": "canary,monitoring,automated",
+            "type": "canary_run",
+            "stored_at": now,
+            "char_count": len(run_content),
+            "canary_passed": passed,
+            "canary_failed": failed,
+            "canary_total": len(results),
+            "run_week": datetime.now(timezone.utc).strftime("%Y-W%W"),
+        }
+        mem_coll = get_or_create_collection("memories")
+        run_emb = await asyncio.to_thread(embed, [run_content])
+        await asyncio.to_thread(
+            mem_coll.add, ids=[run_id], embeddings=run_emb,
+            documents=[run_content], metadatas=[run_meta],
+        )
+        summary["stored_as"] = run_id
+    except Exception as e:
+        summary["store_error"] = str(e)
+
+    return json.dumps({"summary": summary, "results": results})
 
 
 if __name__ == "__main__":

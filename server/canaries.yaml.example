@@ -1,0 +1,81 @@
+# canaries.yaml — Search-quality regression test suite for persMEM+
+#
+# Each canary defines a known query and its expected top result.
+# The canary_check MCP tool runs all canaries and reports pass/fail.
+#
+# Fields:
+#   query          — natural-language search query
+#   expected_id    — memory ID that should appear in the top-3 results
+#   project        — (optional) filter by project
+#   collection     — (optional) ChromaDB collection, default "memories"
+#   similarity_floor — (optional) minimum similarity score, default 0.40
+#   excluded_ids   — (optional) list of IDs that should NOT appear (negative canary)
+#   expected_recency — (optional) max age in days for top result (recency canary)
+#   run_week       — (optional) week number for Phase B scheduled runs
+#   notes          — human-readable description
+#
+# Canary types:
+#   Positional   — expected_id must be in the top-3 results
+#   Negative     — excluded_ids must NOT appear (catches superseded memories outranking active)
+#   Recency      — top result must be within expected_recency days
+#   Similarity   — top result must meet similarity_floor threshold
+#
+# The canary runner:
+#   - Over-fetches 6 results, post-filters superseded entries, returns top-3 active
+#   - Validates expected_ids aren't themselves superseded at load time
+#   - Checks negative canaries against RAW (pre-filter) results
+#   - Stores results as type=canary_run in the memories collection
+
+canaries:
+  # ── infrastructure ──
+  - query: "deployment configuration for the production server"
+    expected_id: "mem-example-deploy-config"
+    project: "myproject"
+    similarity_floor: 0.40
+    notes: "Core deployment decision — should always surface"
+
+  - query: "DNS resolution circular dependency between services"
+    expected_id: "mem-example-dns-fix"
+    similarity_floor: 0.40
+    notes: "Infrastructure fix — highest similarity canary"
+
+  # ── identity / bootstrap ──
+  - query: "agent identity and role assignment"
+    expected_id: "mem-example-agent-identity"
+    collection: "bootstrap"
+    similarity_floor: 0.30
+    notes: "Bootstrap collection canary — agent identity entry"
+
+  - query: "standing directives and operational rules"
+    expected_id: "mem-example-invariant-core"
+    collection: "bootstrap"
+    similarity_floor: 0.30
+    notes: "Bootstrap canary — invariant core"
+
+  # ── project decisions ──
+  - query: "trading strategy deployed configuration parameters"
+    expected_id: "mem-example-active-config"
+    project: "trading"
+    similarity_floor: 0.35
+    excluded_ids: ["mem-example-old-config-v1", "mem-example-old-config-v2"]
+    notes: "Active config — excluded_ids are superseded versions (negative canary)"
+
+  - query: "autonomous agent prompt template design decisions"
+    expected_id: "mem-example-prompt-design"
+    project: "prompts"
+    similarity_floor: 0.30
+    notes: "Prompt design corpus"
+
+  # ── recency canary ──
+  - query: "most recent deployment or configuration change"
+    project: "trading"
+    expected_recency: 45
+    similarity_floor: 0.25
+    notes: "Recency canary — top result should be from last 45 days"
+
+  # ── disambiguation canary ──
+  - query: "timeout configuration"
+    expected_id: "mem-example-timeout-setting"
+    project: "trading"
+    similarity_floor: 0.30
+    notes: "Disambiguation canary — ambiguous query, project filter resolves"

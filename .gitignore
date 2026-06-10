@@ -1,5 +1,41 @@
+# Secrets and credentials
 .env
 secrets.yaml
-*.pyc
+*.key
+*.pem
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# ChromaDB data
+chromadb/
+*.sqlite3
+
+# Node
 node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+*.zip
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# AMQ inboxes (contain agent messages)
+amq/
+
+# Local model weights
+models/
+
+# Backups
+*.bak
+*.backup

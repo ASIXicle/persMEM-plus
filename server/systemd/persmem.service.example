@@ -1,0 +1,27 @@
+[Unit]
+Description=persMEM — Persistent Memory MCP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=persmem
+Group=persmem
+WorkingDirectory=/opt/persmem
+# Optional: verify local embedding model integrity before start
+# ExecStartPre=/usr/bin/sha256sum -c /opt/persmem/models/your-model/.modeling.sha256
+ExecStart=/opt/persmem/venv/bin/python3 /opt/persmem/server.py
+Restart=on-failure
+RestartSec=5
+
+# Required: ChromaDB data directory
+Environment=PERSMEM_DATA_DIR=/var/lib/persmem/chromadb
+# Server bind address and port
+Environment=PERSMEM_HOST=0.0.0.0
+Environment=PERSMEM_PORT=8000
+# Secret path prefix for the MCP endpoint (prevents unauthorized access)
+# Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+Environment=PERSMEM_SECRET_PATH=CHANGE_ME_TO_A_RANDOM_STRING
+
+[Install]
+WantedBy=multi-user.target

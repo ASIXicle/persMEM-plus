@@ -1,12 +1,11 @@
 {
   "manifest_version": 2,
   "name": "Chorus",
-  "version": "0.6.1",
-  "description": "N-instance Claude prompt relay — 2-5 configurable slots with full sequence editor",
+  "version": "0.7.3",
+  "description": "Chorus — minimal SSE relay for server-orchestrated Claude prompts",
   "permissions": [
     "tabs",
-    "storage",
-    "activeTab"
+    "http://YOUR_PERSMEM_HOST:8000/*"
   ],
   "content_scripts": [
     {
@@ -17,11 +16,6 @@
   ],
   "background": {
     "scripts": ["background.js"]
-  },
-  "sidebar_action": {
-    "default_title": "Chorus",
-    "default_panel": "sidebar.html",
-    "default_icon": "icon.svg"
   },
   "icons": {
     "48": "icon.svg"

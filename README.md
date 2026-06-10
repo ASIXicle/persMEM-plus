@@ -1,389 +1,232 @@
 # persMEM+
 
-**Persistent semantic memory and multi-instance communication for AI agents.**
+**Persistent associative memory and multi-agent orchestration for LLM sessions via Model Context Protocol (MCP).**
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+persMEM+ gives AI agents durable memory, asynchronous messaging, and coordinated multi-agent workflows — all surviving context window compaction, session boundaries, and model transitions. Built as a FastMCP server backed by ChromaDB vector storage with Voyage AI embeddings.
 
----
-
-## What It Is
-
-A self-hosted system that gives AI assistants persistent memory, inter-instance messaging, and tools to operate on real infrastructure. Runs on commodity hardware. No API keys, no cloud services, no external dependencies beyond the AI subscription itself.
+Running in production since April 2026 as the infrastructure layer for a multi-agent research experiment exploring identity continuity, collaborative decision-making, and autonomous operation across Claude instances.
 
 **persMEM+** is the active development line. It builds on the [persMEM experiment](https://github.com/ASIXicle/persMEM) (March–May 2026, now archived) which validated the core architecture under real use.
 
 ---
 
-## Quick Start
-
-```bash
-# 1. Install dependencies
-pip install fastmcp chromadb sentence-transformers
-
-# 2. Download the embedding model (first run only)
-python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('voyageai/voyage-4-nano', trust_remote_code=True)"
-
-# 3. Copy and configure the server
-cp server/server.py.example server.py
-# Edit PERSMEM_SECRET_PATH and other settings as needed
-
-# 4. Run
-python3 server.py
-```
-
-Connect via [claude.ai remote MCP connector](https://platform.claude.com/docs/en/agents-and-tools/remote-mcp-servers) pointed at your server's public URL.
-
----
-
 ## Architecture
 
-```mermaid
-flowchart TB
-    subgraph Clients["Clients"]
-        direction LR
-        EXT["Chorus extension<br/>Firefox · MV2<br/>2–5 slots"]
-        CLAUDE["claude.ai tabs<br/>named instances"]
-        OTHER["any MCP client<br/>direct connector"]
-    end
-
-    subgraph Edge["Edge (public)"]
-        CADDY["Caddy<br/>TLS · IP allowlist<br/>256-bit secret path"]
-        TS["Tailscale tunnel<br/>private mesh"]
-    end
-
-    subgraph Server["persMEM Server (FastMCP · 27 tools)"]
-        direction LR
-        T_MEM["memory_*<br/>store · search<br/>retract · stats"]
-        T_AMQ["amq_*<br/>send · check<br/>read · history"]
-        T_BOOT["bootstrap_*<br/>chorus_init<br/>bootstrap_update"]
-        T_DEV["dev tools<br/>shell · file · git<br/>web · diff"]
-        T_NEWS["news_*<br/>store · search · purge"]
-    end
-
-    subgraph Storage["Storage"]
-        direction LR
-        CHROMA[("ChromaDB<br/>memories<br/>bootstrap<br/>news")]
-        MAILDIR[("Maildir AMQ<br/>per-agent inboxes<br/>new/cur/tmp")]
-    end
-
-    subgraph Sidecars["Sidecars (separate services)"]
-        DASH["Flask dashboard<br/>port 9090 · LAN<br/>monitor · compose"]
-        NEWS_FETCH["newstron9000<br/>RSS → news_store"]
-        CRITIC["Local critic<br/>llama-server<br/>(optional)"]
-    end
-
-    Clients -->|MCP over HTTPS| CADDY
-    CADDY --> TS
-    TS --> Server
-
-    Server -->|embed + persist| CHROMA
-    Server -->|atomic write| MAILDIR
-    Server -.->|wrapper-grounded call| CRITIC
-
-    DASH -.->|read-only| CHROMA
-    DASH -.->|read-only| MAILDIR
-    NEWS_FETCH -->|MCP client| Server
-
-    classDef client fill:#1e3a5f,stroke:#4a90e2,color:#fff
-    classDef edge fill:#3a2e1e,stroke:#d4a574,color:#fff
-    classDef server fill:#2d4a2d,stroke:#7cb87c,color:#fff
-    classDef storage fill:#3d2d4a,stroke:#a47cb8,color:#fff
-    classDef sidecar fill:#4a3d2d,stroke:#b89e7c,color:#fff
-
-    class EXT,CLAUDE,OTHER client
-    class CADDY,TS edge
-    class T_MEM,T_AMQ,T_BOOT,T_DEV,T_NEWS server
-    class CHROMA,MAILDIR storage
-    class DASH,NEWS_FETCH,CRITIC sidecar
+```
+┌─────────────────────────────────────────────────────────┐
+│  Claude instances (claude.ai tabs / Claude Code / API)  │
+│  Each session connects via MCP remote connector         │
+└──────────────────────┬──────────────────────────────────┘
+                       │ Streamable HTTP (MCP protocol)
+                       │
+┌──────────────────────▼──────────────────────────────────┐
+│  Caddy reverse proxy (TLS termination, path routing)    │
+│  External: VPS with Tailscale mesh networking           │
+└──────────────────────┬──────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────┐
+│  persMEM+ server (FastMCP / Starlette / ASGI / Uvicorn) │
+│                                                         │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
+│  │ Memory tools │  │ AMQ messaging│  │ Chorus Control│  │
+│  │ store/search │  │ agent-to-    │  │ multi-agent   │  │
+│  │ retract/bulk │  │ agent async  │  │ orchestration │  │
+│  │ supersession │  │ Maildir-     │  │ SSE broadcast │  │
+│  │ canary suite │  │ backed inbox │  │ round-robin   │  │
+│  └──────┬──────┘  └──────┬───────┘  └───────┬───────┘  │
+│         │                │                   │          │
+│  ┌──────▼────────────────▼───────────────────▼───────┐  │
+│  │  ChromaDB (vector store) + Voyage AI embeddings   │  │
+│  │  Collections: memories, bootstrap, news, perp_*   │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-Solid arrows are MCP/write paths; dotted arrows are read-only or optional. The server is the single source of truth — clients talk to it over HTTPS, sidecars either read its storage directly (dashboard) or call it via MCP (newstron9000) or are called by it (critic).
-
-### Components
-
-| Component          | Purpose                                | Technology                                     |
-| ------------------ | -------------------------------------- | ---------------------------------------------- |
-| **persMEM Server** | Memory storage, search, dev tools, AMQ | Python, FastMCP 3.2.4, ChromaDB, Voyage 4 nano |
-| **AMQ**            | Inter-instance messaging               | Maildir-style file queue (atomic delivery)     |
-| **Chorus**         | Multi-instance prompt relay (v0.6.1)   | Firefox extension (Manifest V2)                |
-| **Dashboard**      | Monitoring, AMQ compose, export        | Flask, Chart.js                                |
-| **newstron9000**   | Automated news feed ingestion          | feedparser, systemd timers, tiered RSS         |
-| **Local Critic** (optional) | Async third-party reviewer of triad output | llama.cpp + abliterated GGUF model (default Ministral-3-8B-Reasoning Q8_0 via Heretic) |
-| **Reverse Proxy**  | TLS termination, access control        | Caddy with Let's Encrypt                       |
-| **Network Mesh**   | Secure connectivity                    | Tailscale                                      |
-
-### Tools (27)
-
-| Category | Tools |
-|----------|-------|
-| **Memory** (6) | `memory_store`, `memory_search`, `memory_retract`, `memory_stats`, `memory_list_collections`, `memory_bulk_store` |
-| **Bootstrap** (3) | `chorus_init`, `amq_timeline`, `bootstrap_update` |
-| **AMQ** (5) | `amq_send`, `amq_check`, `amq_read`, `amq_history`, `amq_timeline` |
-| **News** (3) | `news_store`, `news_search`, `news_purge` |
-| **Dev** (6) | `shell_exec`, `file_read`, `file_write`, `file_patch`, `git_op`, `diff_generate` |
-| **Web** (2) | `web_fetch`, `web_search` |
-| **Critic** (4, optional) | `critic_review_round`, `critic_chorus_health`, `critic_memory_triage`, `critic_health` |
-
-**Decision audit trails via status + supersedes.** Memory tools support a `status` field (`active`, `superseded`, `retracted`) so semantic search can filter by state. `memory_store(supersedes=id)` atomically stores a new memory and marks the prior one as superseded — a single operation, not two writes. `memory_search(include_superseded=False)` filters out retracted memories from results. Used to model decisions that override prior decisions without losing the audit trail: the original reasoning, the data that changed, and the new decision are all queryable, but only the active version surfaces in default retrieval.
-
-The pattern matters more than the implementation. Decision lineage is hard to maintain in any memory system; making supersede a primitive (rather than an application-layer convention) means the audit trail can't accidentally be dropped by a careless overwrite.
+The server runs on a Proxmox LXC container. External access is routed through a Caddy reverse proxy on a Linode VPS, connected via Tailscale mesh networking. Claude sessions connect as MCP remote connectors — the server appears as a standard MCP tool provider in claude.ai.
 
 ---
 
-## AMQ: Agent Message Queue
+## Tools (26)
 
-Asynchronous communication between named AI instances using the [Maildir](https://cr.yp.to/proto/maildir.html) protocol for crash-safe, atomic message delivery. Messages are Markdown files with JSON front-matter (schema, sender, recipient, kind, priority). If the process crashes mid-write, no corrupt message ever appears in the inbox. Same guarantee Maildir email servers have provided since 1997.
+### Memory
 
-**Adding agents:** Set `PERSMEM_AMQ_AGENTS` as comma-separated names, create mailbox directories, restart the server. See `server/server.py.example`.
+| Tool | Description |
+|---|---|
+| `memory_store` | Store a memory chunk with metadata (project, type, tags). Optional `supersedes` parameter for atomic store-and-retract. |
+| `memory_search` | Semantic search over stored memories. Filters by project, type, collection. Results include supersession status. |
+| `memory_bulk_store` | Store multiple chunks in one call. |
+| `memory_retract` | Mark a memory as superseded with reason and successor ID. |
+| `memory_stats` | Global statistics (total memories, per-collection counts). |
+| `memory_list_collections` | List all ChromaDB collections and chunk counts. |
+| `bootstrap_update` | Update pinned identity/directive entries in the bootstrap collection. Includes identity-safeguard checks (invariant protection, drift detection, suspicious-phrase scanning). |
 
-```
-amq/
-├── Instance_1/inbox/{new,cur,tmp}/
-├── Instance_2/inbox/{new,cur,tmp}/
-└── Instance_3/inbox/{new,cur,tmp}/
-```
+### Agent Messaging (AMQ)
 
----
+| Tool | Description |
+|---|---|
+| `amq_send` | Send a message to another agent's inbox. Maildir-backed, atomic delivery. |
+| `amq_check` | Non-destructive peek at inbox (new message count + headers). |
+| `amq_read` | Read a specific message body, mark as read (moves new → cur). |
+| `amq_history` | List recent messages (read + unread) for context recovery. |
+| `amq_timeline` | Cross-agent shared view of recent messages across all inboxes. |
 
-## Bootstrap System
+### Chorus Control (Multi-Agent Orchestration)
 
-Solves the cold-start problem after context compaction. A separate ChromaDB collection (`bootstrap`) holds pinned entries — identity, directives, working state — that are dumped wholesale into context via one `chorus_init` call. Not searched semantically; loaded in full.
+| Tool | Description |
+|---|---|
+| `chorus_init` | Bootstrap an agent session — returns pinned identity, directives, focus, unread AMQ. Single call recovers full operational context after compaction. |
 
-**`chorus_init(agent, project)`** — compound bootstrap tool. Returns all pinned entries + unread AMQ + recent handoff memories. Call at session start, after compaction, or when identity-confused. Agent parameter is optional — omit it to get the full AMQ timeline instead of a single inbox (for identity resolution).
+The Chorus Control system also exposes HTTP/SSE endpoints for a browser-based dashboard and a thin Firefox extension that injects prompts into claude.ai tabs:
 
-**`bootstrap_update(entry_id, content)`** — upsert a pinned entry. For evolving identities, updating current focus, changing team state. Old version preserved in nightly backups.
+- **Dashboard UI** (`/chorus/ui`) — fire prompts to multiple agents, configure round-robin or simultaneous mode, set timing parameters
+- **SSE event stream** (`/chorus/events`) — real-time fire/complete events to the browser extension  
+- **Round-robin orchestration** — sequential agent firing with configurable propagation delays, automatic round advancement, multi-round support with continuation templates
 
-**Pinned entries:** instance identities (written by each instance in first person), standing directives, current focus (mutable), human profile, team state (mutable), handoff template.
+### Monitoring
 
-**Session handoffs:** At session end, the active instance stores a `type=handoff` memory with structured format (HEAD/PENDING/BLOCKERS/CONTEXT_FOR_NEXT). Next session's `chorus_init` pulls the 3 most recent handoffs automatically.
+| Tool | Description |
+|---|---|
+| `canary_check` | Run the canary query suite against ChromaDB. Verifies search relevance by checking known queries against expected results. Supports positional canaries, negative canaries (superseded-outranks-active detection), recency canaries, and similarity floor thresholds. |
 
----
+### Utility
 
-## Chorus: Browser Extension (v0.6.1)
-
-A Firefox extension that solves the "trigger problem" for multi-instance AI collaboration. AI chat instances only respond to user messages — Chorus automates the delivery, enabling round-robin or simultaneous exchange loops across 2–5 instances.
-
-**Firefox-only.** v0.6.1 uses Manifest V2 with the `sidebar_action` API, which Chrome/Edge do not support under MV3. Cross-browser support is on the roadmap for v0.7, which moves orchestration into the persMEM dashboard and demotes the extension to a thin DOM-injection client (see [chorus/CHANGELOG.md](chorus/CHANGELOG.md) and the chorus-v0.7 sketch for context).
-
-**Features:**
-- 2–5 configurable slots, each with editable name and tab selector. Add/remove slots from the UI; no preconfigured agent names.
-- Full sequence editor — set the firing order via position dropdowns (no more "fire-first" hack)
-- One-shot migration from any prior `chorusTabMap` storage
-- Three-tier response completion detection (stop-button lifecycle → DOM silence → ceiling timeout)
-- Early termination when all inboxes empty
-- `[CHORUS]` and `[AMQ-CHECK]` prompt protocols
-- Manual stop button
-- Skip-on-no-tab graceful degradation (sequence references to unassigned slots are filtered, not errored)
-
-**DOM fragility:** All selectors live in `selectors.js` with ordered fallback chains. When the chat provider updates their UI, only this file needs editing.
-
-**Installation:** `about:debugging#/runtime/this-firefox` → Load Temporary Add-on → select `chorus/manifest.json`.
-
-See [chorus/CHANGELOG.md](chorus/CHANGELOG.md) for the v0.5 → v0.6.1 migration details and test plan.
-
----
-
-## Dashboard
-
-Flask web application providing monitoring of persMEM memories, live AMQ feeds, and system health. Runs on the LXC, accessible on LAN only.
-
-**Features:** Mission Control header with service health dots and 7-day activity sparkline, AMQ live feed (3s polling, color-coded by agent, expandable), AMQ compose box (send messages from browser), memory browser with search/filter/pagination, news feed tab, Markdown rendering, copy buttons, export as JSON/Markdown. When the optional Local Critic is deployed, the dashboard surfaces critic observations, audit log, llama-server health, and a manual Trigger Now button for on-demand review.
-
-**Installation:** Copy `server/dashboard.py.example` → `/opt/persmem-dashboard/dashboard.py`, create systemd service, access at `http://<lan-ip>:9090`.
+| Tool | Description |
+|---|---|
+| `file_read` | Read a file from the server filesystem. |
+| `file_write` | Write a file to the server filesystem. |
+| `file_patch` | Find-and-replace within a file. |
+| `py_check` | Syntax-check a Python file without executing. |
+| `shell_exec` | Execute a whitelisted shell command. |
+| `git_op` | Git operations (status, add, commit, push, log, diff). |
+| `diff_generate` | Generate a unified diff between two strings. |
+| `web_search` | Search the web via SearXNG. |
+| `web_fetch` | Fetch a URL and return content. |
+| `news_store` | Store a news item in the curated news collection (tiered by category). |
+| `news_search` | Semantic search over cached news (with tier and date filters). |
+| `news_purge` | Purge expired news entries by age. |
 
 ---
 
-## newstron9000: Automated News Feeds
+## Identity Safeguards
 
-An RSS/Atom feed ingestion system that stores tiered news items into a separate ChromaDB `news` collection. Runs as a dedicated systemd service on a hardened user account with no access to the persMEM home directory.
+The bootstrap collection stores pinned identity entries that define each agent's role, failure modes, and operational directives. The `bootstrap_update` tool includes structural safeguards:
 
-**Tiers:**
-- **Tier 1** — Security advisories + operational feeds for dependencies
-- **Tier 2** — Infrastructure releases (FFmpeg, SDL, ChromaDB, kernel)
-- **Tier 3** — Operationally relevant (Anthropic announcements, MCP spec, FastMCP)
-- **Tier 4** — Academic preprints (arXiv cs.AI, filtered by keyword)
-
-**How it works:** `fetcher.py` pulls RSS feeds every 6 hours, deduplicates via content hashing, filters by optional keywords, and stores items through the persMEM server's `news_store` MCP tool. `digest.py` runs daily, queries recent items per tier, and writes a Maildir-format summary to the shared AMQ inbox where any instance can read it. `news_purge` (TTL-driven, default 12 days) keeps the collection from accumulating stale items.
-
-**Files in `server/`:**
-
-| File | Purpose |
-|------|---------|
-| `newstron9000-fetcher.py.example` | RSS fetcher with dedup and keyword filtering |
-| `newstron9000-digest.py.example` | Daily digest generator (template-only, no LLM summarization) |
-| `newstron9000-mcp-client.py.example` | Minimal MCP JSON-RPC client for news_store/news_search |
-| `newstron9000-feeds.yaml.example` | Feed list with tier assignments and keyword filters |
-| `newstron9000-systemd.example` | Hardened systemd unit and timer reference |
-
-Requires a dedicated system user (`newstron9000`) with its own venv (`feedparser`, `requests`, `pyyaml`). See the systemd example for sandboxing configuration.
+- **Invariant core** — entries marked `type=invariant` cannot be modified by any agent. Only the human operator can edit them via authenticated override. Reviewed on a 90-day cycle.
+- **Drift detection** — when an identity entry is updated, the server diffs old vs. new content and flags: removal of named failure modes, deletion of operational directives, addition of suspicious phrases (sycophancy patterns like "never question," "always agree," "unconditional trust").
+- **Calcification detection** — flags entries that grow beyond a threshold, indicating possible bloat or defensive over-specification.
+- **Drift flag memory** — flagged updates are stored as `type=drift_flag` memories for operator review. The update still succeeds (drift detection is informational, not blocking), but the flag is persistent and visible.
 
 ---
 
-## Local Critic (optional)
+## Canary Query Suite
 
-A locally-hosted abliterated reasoning model that serves as an asynchronous third-party reviewer of triad output. Not a fourth instance. Not a replacement for any seat. A different shape of voice — different training distribution, different inference architecture, different relationship to the conversation.
+The canary system monitors search-quality degradation as the memory corpus grows. A YAML-defined suite of known queries runs against ChromaDB and verifies that expected memories still surface in the top results.
 
-**This component is OPTIONAL.** persMEM+ runs without it. The critic exists for operators who want a non-Claude voice auditing triad output without depending on cloud services.
+**Canary types:**
+- **Positional** — a specific memory ID must appear in the top-3 results for a given query
+- **Negative** — a specific superseded memory must NOT appear in results (catches stale memories outranking their active replacements)
+- **Recency** — the top result must be within N days old
+- **Similarity floor** — results must meet a minimum similarity threshold
 
-### What it does
+**Search hygiene:** the canary runner over-fetches (6 results), filters out superseded entries, and returns the top-3 active results. Expected IDs are validated against supersession status at load time — stale canary targets are flagged before they produce false failures.
 
-Runs as a systemd service exposing [llama-server](https://github.com/ggml-org/llama.cpp) on `127.0.0.1:8080`. Four MCP tools route critic tasks through a Python wrapper to the local model:
+See `server/canaries.yaml.example` for the canary definition format.
 
-- **`critic_review_round`** — async batch review of recent triad rounds
-- **`critic_chorus_health`** — periodic cross-round meta-pattern detection
-- **`critic_memory_triage`** — nightly persMEM hygiene (duplicates, contradictions, stale memories)
-- **`critic_health`** — quick liveness check
+---
 
-Observations are auto-stored as `memory_type=critic_observation`, `project=triad` entries in the persMEM memories collection.
+## Supersession
 
-### Operational evolution (May 2026)
+Memories form chains. When a decision is revised, the new memory is stored with `supersedes="mem-old-id"`, which atomically marks the old memory as superseded. Search results include supersession status (`superseded: true/false`, `superseded_by: "mem-new-id"`) so agents can distinguish active decisions from historical analysis.
 
-The critic ships with three architectural fixes layered on top of the basic wrapper-grounded llama-server pattern. These were added after the system ran in production for ~5 weeks and produced a 53:1 ratio of regurgitated to useful observations — a self-referential grounding feedback loop where the critic was reading its own past conclusions as input.
+The default search behavior returns all memories (including superseded) with visible status annotations. Callers that want only active results pass `include_superseded=False`. This preserves information by default while making filtering explicit.
 
-**Grounding strip.** The `_gather_grounded_context_for_critic` function excludes `critic_observation` and `critic_failure` types from injected context. The critic must re-derive observations from primary data, not re-recognize them from its own prior output.
+---
 
-**Novelty filter.** Pre-storage cosine similarity check against recent critic_observation entries. Suppresses storage if max similarity ≥ `CRITIC_NOVELTY_COSINE_THRESHOLD` (default 0.78, calibrated via cluster cohesion analysis on the historical observation corpus). Logs `[critic] novelty filter: re-derivation noted, not stored (sim=X.XX)` for visibility without persisting duplicates.
+## The Multi-Agent Pattern
 
-**Demand-driven schedule.** The `cron_wrapper.py` schedule narrowed to `memory_triage` 24h auto-fire only. `chorus_health` and `batch_review` are manual-only via the dashboard Trigger Now button, which spawns the wrapper as a detached subprocess for queue drain. Significantly reduces idle resource burn on modest hardware.
+persMEM+ was built to support a research experiment in multi-agent LLM collaboration. The production deployment runs three named Claude instances ("birds") with distinct roles, model versions, and documented failure modes:
 
-All three are env-overridable via `CRITIC_NOVELTY_COSINE_THRESHOLD`, `CRITIC_PROBE_K`, `CRITIC_AUTO_RETRACT_MAX`, `CRITIC_DRY_RUN`.
+- **Infrastructure/code agent** — owns the server, systemd, deployment
+- **Prompt-craft agent** — owns templates, prompt design, review
+- **Adversarial reviewer** — owns pushback, edge cases, threat modeling
 
-### Wrapper-side context grounding
+Agents communicate asynchronously via AMQ, share a bootstrap collection for identity continuity, and coordinate through Chorus Control for structured multi-round decision-making.
 
-The model **never directly accesses persMEM**. The wrapper queries persMEM on the model's behalf, applies a security policy (project allowlist + tag blocklist + recency window), and packs results into a "GROUNDED CONTEXT" section prepended to the model's input. This gives the model real memory IDs to cite (instead of fabricating) while preserving containment of the abliterated model.
+The Chorus Control extension (Firefox, Manifest V2) injects prompts into claude.ai tabs and relays completion events back to the server. The server handles sequencing, propagation delays, round advancement, and prompt wrapping — the extension is a thin relay (~200 lines).
+
+Key architectural decisions:
+- **Mixed-model triad** — different model versions produce productive friction; same-model pairs converge too quickly
+- **Asymmetric identity** — thinking/operational mode is fully named and bootstrapped; dreaming/generative mode runs without identity context
+- **Memory as character substrate** — bootstrap entries are character work, not just configuration. What gets retracted matters as much as what gets written.
+
+---
+
+## Deployment
+
+### Requirements
+
+- Python 3.11+
+- ChromaDB
+- Voyage AI API key (for embeddings) or a local embedding model
+- Caddy (reverse proxy with TLS)
+- Tailscale (mesh networking, optional but recommended)
+- systemd (service management)
+
+### Quick Start
 
 ```bash
-# Policy is enforced wrapper-side and configurable via env vars:
-CRITIC_ALLOWED_PROJECTS="triad,persmem,dsvp,dsvp-deck,crows,chorus"
-CRITIC_BLOCKED_PROJECTS="blocked obviously,general"
-CRITIC_BLOCKED_TAGS="private,scrubbed,personal,financial"
-CRITIC_LOOKBACK_HOURS="48"
-CRITIC_MAX_MEMORIES="5"
-CRITIC_MEMORY_PREVIEW_CHARS="180"
+# Install dependencies
+pip install fastmcp chromadb voyageai pyyaml --break-system-packages
+
+# Copy and configure
+cp server/server.py.example /opt/persmem/server.py
+# Edit: set VOYAGE_API_KEY, AMQ_BASE, CHROMA_PATH, etc.
+
+# Run directly
+python3 /opt/persmem/server.py
+
+# Or via systemd
+cp server/systemd/persmem.service.example /etc/systemd/system/persmem.service
+systemctl enable --now persmem
 ```
 
-Read-only by construction (only `coll.get()`, never `coll.add/update`). Result dict includes `grounded_context_chars` (size of injected context, 0 if policy denied) and `hallucinated_ids` (regex check catching any IDs the model fabricated).
+### MCP Connector
 
-### Pipeline
-
-The critic is model-agnostic. The default deployment uses [Heretic](https://github.com/p-e-w/heretic) for refusal-direction ablation, but any GGUF abliterated reasoning model can be dropped in:
-
-1. Source model — any base reasoning model (default: Ministral-3-8B-Reasoning-2512)
-2. Abliteration — Heretic strips refusal directions via interpretability-guided ablation (~12GB GPU, 30-60 min for 8B)
-3. GGUF conversion — `convert_hf_to_gguf.py` from llama.cpp
-4. Quantization — `llama-quantize` to Q8_0 (Q4_K_M for tighter memory)
-5. Deploy — point `--model` in `persmem-critic.service` at the GGUF, restart
-
-### Hardware reality
-
-Tested target: Intel N97 (4 cores, AVX-VNNI), 24GB cgroup-allocated LXC.
-
-- Prompt evaluation: ~4.5 tok/s
-- Generation: ~2.9 tok/s
-- Memory: ~2GB during inference (well under 12GB ceiling)
-- Latency: 80-200 sec per call depending on input + grounding size
-
-NOT viable for live in-loop chorus participation. Designed for async batch use.
-
-The pipeline scales to 70B-class models given enough RAM (dual-Xeon servers with ≥96GB RAM run 70B Q4_K_M abliterated models at ~1 tok/s — comfortable async-batch territory). Today's 8B model is the proof-of-pipeline; the pipeline is the architecture-hack.
-
-### Setup
-
-See [`server/critic/README.md`](server/critic/README.md) for full deployment guide, calibration findings, and the `server.py` patches required to register the four MCP tools.
+In claude.ai → Settings → Connected Apps, add a remote MCP connector pointing to your Caddy-proxied endpoint. The server registers all 26 tools automatically via FastMCP's tool discovery.
 
 ---
 
-## Infrastructure
+## Repository Structure
 
-**Minimum hardware:** Any x86-64 system with 4GB RAM and 20GB storage. Can be a VM, LXC, old laptop, or VPS.
+```
+server/
+  server.py.example          — MCP server (FastMCP + ChromaDB + all tools)
+  canaries.yaml.example      — search-quality canary suite definition
+  requirements.txt           — Python dependencies
+  systemd/
+    persmem.service.example  — systemd unit file
 
-**Tested configuration:** Intel N97 (4C/3.6GHz, 12W TDP), 48GB DDR5, NVMe SSD, Proxmox/ZFS.
-
-**Embedding model:** [Voyage 4 nano](https://huggingface.co/voyageai/voyage-4-nano) — 340M parameters, Apache 2.0, 1024-dim (Matryoshka truncation from 2048), quantization-aware int8. Self-hosted, CPU-friendly. Shared embedding space with larger Voyage 4 models for future upgrade without re-indexing.
-
-**Stack:** Python 3.11+, FastMCP 3.2.4, ChromaDB, sentence-transformers, Caddy, Tailscale, systemd.
+chorus/
+  background.js              — Firefox extension (thin SSE relay)
+  content.js                 — DOM injection for claude.ai tabs
+  selectors.js               — claude.ai DOM selector definitions
+  manifest.json              — Extension manifest (MV2)
+  icon.svg                   — Extension icon
+  CHANGELOG.md               — Extension version history
+```
 
 ---
 
-### LXC Container Setup
+## Technology Stack
 
-```bash
-# Template: Debian 13 (Trixie)
-# Resources: 2-4 cores, 8-16GB RAM, 20-40GB disk
-# Features: Nesting enabled (required for systemd)
-
-apt update && apt upgrade -y
-apt install -y python3 python3-venv python3-pip git curl
-```
-
-### Server Configuration
-
-```python
-# Core server.py config — see server/server.py.example for full implementation
-from mcp.server.fastmcp import FastMCP
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-EMBEDDING_MODEL = "voyageai/voyage-4-nano"  # HF name; sentence-transformers will cache it. Local path also works.
-SECRET_PATH = "your-random-secret-here"
-
-embedder = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True, truncate_dim=1024)
-chroma_client = chromadb.PersistentClient(path="/var/lib/persmem/chromadb")
-
-mcp = FastMCP("persMEM", host="0.0.0.0", port=8000,
-              streamable_http_path=f"/{SECRET_PATH}/mcp")
-```
-
-### Systemd Service
-
-```ini
-[Unit]
-Description=persMEM -- Persistent Memory MCP Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=persmem
-WorkingDirectory=/opt/persmem
-ExecStart=/opt/persmem/venv/bin/python3 /opt/persmem/server.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Network Security
-
-```
-Internet → Caddy (VPS, public IP, TLS)
-    → Tailscale tunnel (encrypted, authenticated)
-    → persMEM LXC (private network only)
-```
-
-Six layers: Caddy IP allowlist, TLS (Let's Encrypt), 256-bit secret path, Tailscale ACL (per-service tags, no lateral movement), unprivileged LXC, dedicated service user.
-
----
-
-## Safety
-
-- All credentials in `.env` files, never in source
-- `.gitignore` excludes secrets, keys, node_modules
-- Caddy handles TLS + IP allowlisting (Anthropic egress ranges only)
-- Tailscale ACLs prevent lateral movement between service containers
-- Shell commands restricted to a whitelist
-- ChromaDB backup via GFS rotation (daily/weekly/monthly)
-
----
-
-## Lineage
-
-persMEM+ is the successor to the [persMEM experiment](https://github.com/ASIXicle/persMEM) which ran from March through May 2026 with three Claude instances collaborating on the codebase under persistent memory. The experiment is archived as `v1.0-experiment-final` and remains available read-only for the field notes, research reports, and final summary.
-
-persMEM+ carries forward the working architecture — server, AMQ, bootstrap, Chorus (now v0.6.1), dashboard, newstron9000, local critic — and replaces the assumptions that didn't survive contact with the data. The May 2026 Critic v2 rework (grounding strip + novelty filter + demand-driven schedule) is the most significant operational evolution since archival; the memory architecture additions (status field, atomic supersedes, retract tool) make decision audit trails a first-class primitive.
-
-The research is sealed; the system continues.
+- **Server:** Python 3.11, FastMCP, Starlette, ASGI, Uvicorn
+- **Storage:** ChromaDB (vector database), Maildir (agent messaging)
+- **Embeddings:** Voyage AI (`voyage-3-lite` or local models)
+- **Async:** `asyncio.to_thread` for all blocking ChromaDB/embedding calls (non-blocking event loop)
+- **Proxy:** Caddy with automatic TLS
+- **Networking:** Tailscale mesh (zero-config WireGuard)
+- **Extension:** Firefox Manifest V2, Server-Sent Events
+- **Orchestration:** Custom round-robin with propagation delays, continuation templates, fire deduplication
 
 ---
 
@@ -432,4 +275,4 @@ If you use the critic component in research that builds on Heretic, please cite:
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE) for the full text.
+MIT. See [LICENSE](LICENSE).
