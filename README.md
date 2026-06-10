@@ -12,35 +12,7 @@ Running in production since April 2026 as the infrastructure layer for a multi-a
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Claude instances (claude.ai tabs / Claude Code / API)  │
-│  Each session connects via MCP remote connector         │
-└──────────────────────┬──────────────────────────────────┘
-                       │ Streamable HTTP (MCP protocol)
-                       │
-┌──────────────────────▼──────────────────────────────────┐
-│  Caddy reverse proxy (TLS termination, path routing)    │
-│  External: VPS with Tailscale mesh networking           │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────┐
-│  persMEM+ server (FastMCP / Starlette / ASGI / Uvicorn) │
-│                                                         │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │ Memory tools │  │ AMQ messaging│  │ Chorus Control│  │
-│  │ store/search │  │ agent-to-    │  │ multi-agent   │  │
-│  │ retract/bulk │  │ agent async  │  │ orchestration │  │
-│  │ supersession │  │ Maildir-     │  │ SSE broadcast │  │
-│  │ canary suite │  │ backed inbox │  │ round-robin   │  │
-│  └──────┬──────┘  └──────┬───────┘  └───────┬───────┘  │
-│         │                │                   │          │
-│  ┌──────▼────────────────▼───────────────────▼───────┐  │
-│  │  ChromaDB (vector store) + Voyage AI embeddings   │  │
-│  │  Collections: memories, bootstrap, news, perp_*   │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
-```
+![persMEM+ architecture](architecture.svg)
 
 The server runs on a Proxmox LXC container. External access is routed through a Caddy reverse proxy on a Linode VPS, connected via Tailscale mesh networking. Claude sessions connect as MCP remote connectors — the server appears as a standard MCP tool provider in claude.ai.
 
