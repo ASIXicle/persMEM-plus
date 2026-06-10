@@ -252,24 +252,6 @@ This is an active project. Contributions, questions, and forks are welcome. The 
 - **[Chart.js](https://www.chartjs.org/)** — Dashboard visualizations
 - **[Caddy](https://caddyserver.com/)** — Reverse proxy with automatic TLS
 - **[Tailscale](https://tailscale.com/)** — Network mesh
-- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — GGUF inference engine for the local critic component
-- **[Heretic](https://github.com/p-e-w/heretic)** by Philipp Emanuel Weidmann — Refusal-direction ablation for the critic's local model
-- **[Mistral AI](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512)** — Ministral-3-8B-Reasoning base model used in the default critic deployment
-
-### Citations
-
-If you use the critic component in research that builds on Heretic, please cite:
-
-```bibtex
-@misc{heretic,
-  author = {Weidmann, Philipp Emanuel},
-  title = {Heretic: Fully automatic censorship removal for language models},
-  year = {2025},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/p-e-w/heretic}}
-}
-```
 
 ---
 
